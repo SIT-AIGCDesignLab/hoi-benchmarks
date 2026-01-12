@@ -1,0 +1,22 @@
+[project]
+name = "hoi-benchmarks"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.75.0",
+    "bert-score>=0.3.13",
+    "google-genai>=1.57.0",
+    "numpy>=2.4.1",
+    "openai>=2.15.0",
+    "pillow>=12.1.0",
+    "pycocoevalcap>=1.2",
+    "pycocotools>=2.0.11",
+    "python-dotenv>=1.2.1",
+    "sentencepiece>=0.2.1",
+    "tiktoken>=0.12.0",
+    "tqdm>=4.67.1",
+    "transformers==4.36.0",
+    "wandb>=0.23.1",
+]
