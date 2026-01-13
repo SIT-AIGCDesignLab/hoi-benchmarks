@@ -43,8 +43,21 @@ if [ -d .venv ]; then
 fi
 
 MODEL_NAME="${1:-gemini-3-pro-preview}"
-OUTPUT_DIR="${2:-results/hico_ground_gemini}"
 
+# Ensure output directory is always under results/
+if [ -z "$2" ]; then
+    OUTPUT_DIR="results/hico_ground_gemini"
+else
+    # If custom path provided, ensure it's under results/
+    if [[ "$2" != results/* ]]; then
+        OUTPUT_DIR="results/$2"
+    else
+        OUTPUT_DIR="$2"
+    fi
+fi
+
+# Ensure results directory exists
+mkdir -p results
 mkdir -p "$OUTPUT_DIR"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
