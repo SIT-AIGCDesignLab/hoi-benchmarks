@@ -454,14 +454,48 @@ def match_pairs_greedy(pred_pairs: List[Dict], gt_pairs: List[Dict], iou_thresho
     return matches, unmatched_preds, unmatched_gts
 
 
+def get_box_area(box):
+    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
+    """
+    Categorize a ground truth pair by object size.
+    Uses the object box area for categorization (COCO standard).
+    
+    Returns: 'small', 'medium', or 'large'
+    """
+    object_area = get_box_area(gt_pair['object_box'])
+    
+    if object_area < area_small:
+        return 'small'
+    elif object_area < area_medium:
+        return 'medium'
+    else:
+        return 'large'
+
+
 def compute_grounding_metrics(all_predictions: List[Dict], all_ground_truth: List[Dict]) -> Dict:
     """Compute COCO-style AR metrics at different IoU thresholds."""
     iou_thresholds = np.arange(0.5, 1.0, 0.05)
     recalls_per_threshold = []
+    
+    # COCO area thresholds for small/medium/large objects
+    AREA_SMALL = 32 ** 2    # < 1024 pixels²
+    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
+    
+    recalls_small = []
+    recalls_medium = []
+    recalls_large = []
 
     for iou_thresh in iou_thresholds:
         total_recall = 0.0
         total_samples = 0
+        
+        tp_small, fn_small = 0, 0
+        tp_medium, fn_medium = 0, 0
+        tp_large, fn_large = 0, 0
 
         for pred, gt in zip(all_predictions, all_ground_truth):
             pred_pairs = pred.get('pairs', [])
@@ -474,14 +508,52 @@ def compute_grounding_metrics(all_predictions: List[Dict], all_ground_truth: Lis
             recall = len(matches) / len(gt_pairs)
             total_recall += recall
             total_samples += 1
+            
+            # Track size-specific metrics
+            matched_gt_indices = {m[1] for m in matches}
+            for gt_idx, gt_pair in enumerate(gt_pairs):
+                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
+                if gt_idx in matched_gt_indices:
+                    # True Positive for this size category
+                    if size_category == 'small':
+                        tp_small += 1
+                    elif size_category == 'medium':
+                        tp_medium += 1
+                    else:
+                        tp_large += 1
+                else:
+                    # False Negative for this size category
+                    if size_category == 'small':
+                        fn_small += 1
+                    elif size_category == 'medium':
+                        fn_medium += 1
+                    else:
+                        fn_large += 1
 
         avg_recall = total_recall / total_samples if total_samples > 0 else 0.0
         recalls_per_threshold.append(avg_recall)
+        
+        # Calculate size-specific recalls
+        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
+        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
+        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
+        
+        recalls_small.append(recall_small)
+        recalls_medium.append(recall_medium)
+        recalls_large.append(recall_large)
+    
+    # Calculate size-based AR metrics
+    ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
+    ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
+    ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
 
     metrics = {
         'AR': float(np.mean(recalls_per_threshold)),
         'AR@0.5': recalls_per_threshold[0],
         'AR@0.75': recalls_per_threshold[5],
+        'ARs': ar_small,
+        'ARm': ar_medium,
+        'ARl': ar_large,
     }
 
     return metrics
@@ -840,6 +912,9 @@ def main():
     print(f"{'AR':<20} {metrics['AR']*100:>9.2f}%  {'Average Recall @ IoU=0.50:0.95':<45}")
     print(f"{'AR@0.5':<20} {metrics['AR@0.5']*100:>9.2f}%  {'Average Recall @ IoU=0.50':<45}")
     print(f"{'AR@0.75':<20} {metrics['AR@0.75']*100:>9.2f}%  {'Average Recall @ IoU=0.75':<45}")
+    print(f"{'ARs':<20} {metrics['ARs']*100:>9.2f}%  {'Average Recall for small objects (area < 32²)':<45}")
+    print(f"{'ARm':<20} {metrics['ARm']*100:>9.2f}%  {'Average Recall for medium objects (32² < area < 96²)':<45}")
+    print(f"{'ARl':<20} {metrics['ARl']*100:>9.2f}%  {'Average Recall for large objects (area > 96²)':<45}")
     print("=" * 80)
 
     if use_wandb:

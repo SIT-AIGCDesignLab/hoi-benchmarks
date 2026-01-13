@@ -348,20 +348,97 @@ def match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5):
     return matches, list(set(range(len(pred_pairs))) - matched_preds), list(set(range(len(gt_pairs))) - matched_gts)
 
 
+def get_box_area(box):
+    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
+    """
+    Categorize a ground truth pair by object size.
+    Uses the object box area for categorization (COCO standard).
+    
+    Returns: 'small', 'medium', or 'large'
+    """
+    object_area = get_box_area(gt_pair['object_box'])
+    
+    if object_area < area_small:
+        return 'small'
+    elif object_area < area_medium:
+        return 'medium'
+    else:
+        return 'large'
+
+
 def compute_grounding_metrics(all_predictions, all_ground_truth):
     """Compute COCO-style AR metrics."""
+    # COCO area thresholds for small/medium/large objects
+    AREA_SMALL = 32 ** 2    # < 1024 pixels²
+    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
+    
     recalls = []
+    recalls_small = []
+    recalls_medium = []
+    recalls_large = []
+    
     for iou_thresh in np.arange(0.5, 1.0, 0.05):
         total_recall, total_samples = 0.0, 0
+        tp_small, fn_small = 0, 0
+        tp_medium, fn_medium = 0, 0
+        tp_large, fn_large = 0, 0
+        
         for pred, gt in zip(all_predictions, all_ground_truth):
             pred_pairs, gt_pairs = pred.get('pairs', []), gt.get('pairs', [])
             if len(gt_pairs) == 0: continue
             matches, _, _ = match_pairs_greedy(pred_pairs, gt_pairs, iou_thresh)
             total_recall += len(matches) / len(gt_pairs)
             total_samples += 1
+            
+            # Track size-specific metrics
+            matched_gt_indices = {m[1] for m in matches}
+            for gt_idx, gt_pair in enumerate(gt_pairs):
+                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
+                if gt_idx in matched_gt_indices:
+                    # True Positive for this size category
+                    if size_category == 'small':
+                        tp_small += 1
+                    elif size_category == 'medium':
+                        tp_medium += 1
+                    else:
+                        tp_large += 1
+                else:
+                    # False Negative for this size category
+                    if size_category == 'small':
+                        fn_small += 1
+                    elif size_category == 'medium':
+                        fn_medium += 1
+                    else:
+                        fn_large += 1
+        
         recalls.append(total_recall / total_samples if total_samples > 0 else 0.0)
+        
+        # Calculate size-specific recalls
+        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
+        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
+        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
+        
+        recalls_small.append(recall_small)
+        recalls_medium.append(recall_medium)
+        recalls_large.append(recall_large)
+    
+    # Calculate size-based AR metrics
+    ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
+    ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
+    ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
 
-    return {'AR': float(np.mean(recalls)), 'AR@0.5': recalls[0], 'AR@0.75': recalls[5]}
+    return {
+        'AR': float(np.mean(recalls)),
+        'AR@0.5': recalls[0],
+        'AR@0.75': recalls[5],
+        'ARs': ar_small,
+        'ARm': ar_medium,
+        'ARl': ar_large,
+    }
 
 
 def main():
@@ -705,6 +782,9 @@ def main():
     print(f"  AR:      {metrics['AR']*100:.2f}%")
     print(f"  AR@0.5:  {metrics['AR@0.5']*100:.2f}%")
     print(f"  AR@0.75: {metrics['AR@0.75']*100:.2f}%")
+    print(f"  ARs:     {metrics['ARs']*100:.2f}%  (small objects, area < 32²)")
+    print(f"  ARm:     {metrics['ARm']*100:.2f}%  (medium objects, 32² < area < 96²)")
+    print(f"  ARl:     {metrics['ARl']*100:.2f}%  (large objects, area > 96²)")
     print("=" * 80)
 
     if use_wandb:
