@@ -25,6 +25,220 @@ source .venv/bin/activate
 
 ---
 
+## Batch Processing (50% Cost Savings) - RECOMMENDED
+
+For large-scale evaluations, use the **Batch API mode** which offers:
+- **50% cost reduction** compared to real-time API calls
+- **No rate limit issues** (separate quota pools)
+- **Automatic checkpointing** for resumability
+- **24-hour completion window** (usually much faster)
+
+### Quick Start - Batch Mode
+
+```bash
+# Usage: bash run_batch_eval.sh <provider> <task> [model]
+# Providers: claude, gemini, openai
+# Tasks: swig_action, swig_ground, hico_action, hico_ground
+
+# Show help and available models
+bash run_batch_eval.sh --help
+
+# SWIG Action Referring - Gemini (uses default: gemini-2.5-flash)
+bash run_batch_eval.sh gemini swig_action
+
+# SWIG Action Referring - Gemini 3 Pro (best accuracy)
+bash run_batch_eval.sh gemini swig_action gemini-3-pro-preview
+
+# SWIG Grounding - Claude Sonnet (default)
+bash run_batch_eval.sh claude swig_ground
+
+# SWIG Grounding - Claude Opus (highest accuracy)
+bash run_batch_eval.sh claude swig_ground claude-opus-4-5
+
+# HICO Action Referring - OpenAI GPT-4o (default)
+bash run_batch_eval.sh openai hico_action
+
+# HICO Action Referring - OpenAI GPT-5.2 (most capable)
+bash run_batch_eval.sh openai hico_action gpt-5.2-2025-12-11
+```
+
+---
+
+### Choosing Your Model
+
+The batch script allows you to specify any model as the **third argument**:
+
+```bash
+# Syntax
+bash run_batch_eval.sh <provider> <task> <model>
+```
+
+**View all available models:**
+```bash
+bash run_batch_eval.sh --help
+```
+
+#### Model Selection Examples
+
+```bash
+# Use default model (cost-effective)
+bash run_batch_eval.sh gemini swig_action
+
+# Specify a different Gemini model
+bash run_batch_eval.sh gemini swig_action gemini-3-pro-preview
+bash run_batch_eval.sh gemini swig_action gemini-2.5-pro
+
+# Specify a different Claude model
+bash run_batch_eval.sh claude swig_action claude-opus-4-5-20251101
+bash run_batch_eval.sh claude swig_action claude-haiku-4-5-20250514
+
+# Specify a different OpenAI model
+bash run_batch_eval.sh openai swig_action gpt-5.2-2025-12-11
+bash run_batch_eval.sh openai swig_action gpt-4o-mini
+```
+
+#### Available Models Reference
+
+| Provider | Model Name | Type | Cost (Input/Output per MTok) |
+|----------|------------|------|------------------------------|
+| **Gemini** | `gemini-2.5-flash` | Default | $0.15 / $1.25 |
+| | `gemini-2.5-pro` | Better | $0.625 / $5.00 |
+| | `gemini-3-flash-preview` | Latest Fast | $0.15 / $1.25 |
+| | `gemini-3-pro-preview` | **Best Accuracy** | $0.625 / $5.00 |
+| **Claude** | `claude-haiku-4-5` | Fastest | $0.50 / $2.50 |
+| | `claude-sonnet-4-5` | Default | $1.50 / $7.50 |
+| | `claude-opus-4-5` | **Best Accuracy** | $7.50 / $37.50 |
+| **OpenAI** | `gpt-4o-mini` | Cheapest | $0.075 / $0.30 |
+| | `gpt-4o` | Default | $1.25 / $5.00 |
+| | `gpt-5.2-2025-12-11` | **Best Accuracy** | ~$2.50 / $10.00 |
+
+#### When to Use Which Model
+
+| Use Case | Gemini | Claude | OpenAI |
+|----------|--------|--------|--------|
+| **Testing/Development** | `gemini-2.5-flash` | `claude-haiku-4-5` | `gpt-4o-mini` |
+| **Production (balanced)** | `gemini-2.5-pro` | `claude-sonnet-4-5` | `gpt-4o` |
+| **Best Accuracy** | `gemini-3-pro-preview` | `claude-opus-4-5` | `gpt-5.2-2025-12-11` |
+
+---
+
+### Resume Interrupted Batch
+
+If a batch job is interrupted, resume it with:
+
+```bash
+RESUME=1 bash run_batch_eval.sh gemini swig_action
+```
+
+### Batch Mode with Limited Samples (Testing)
+
+```bash
+# Test with 10 samples
+MAX_SAMPLES=10 bash run_batch_eval.sh gemini swig_action
+
+# Test with 5 samples, skip BERTScore for speed
+MAX_SAMPLES=5 SKIP_BERTSCORE=1 bash run_batch_eval.sh claude hico_action
+```
+
+### Batch vs Real-time Comparison
+
+| Aspect | Real-time API | Batch API |
+|--------|--------------|-----------|
+| Cost | Full price | **50% off** |
+| Rate limits | Shared pool (hits limits) | **Separate pool** |
+| Latency | Immediate | Up to 24 hours (usually <1 hour) |
+| Resumability | Manual caching | **Auto checkpoint** |
+| Best for | Quick tests | **Full evaluations** |
+
+### Batch Environment Variables
+
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `RESUME=1` | Resume from checkpoint | `0` | `RESUME=1` |
+| `MAX_SAMPLES=N` | Limit to N samples | all | `MAX_SAMPLES=100` |
+| `POLL_INTERVAL=N` | Seconds between status checks | `60` | `POLL_INTERVAL=30` |
+| `OPTIMIZED_PROMPTS=1` | Use shorter prompts | `0` | `OPTIMIZED_PROMPTS=1` |
+| `SKIP_BERTSCORE=1` | Skip BERTScore computation | `0` | `SKIP_BERTSCORE=1` |
+| `WANDB=1` | Enable Weights & Biases logging | `0` | `WANDB=1` |
+| `WANDB_PROJECT=name` | Custom W&B project name | `hoi-batch-eval` | `WANDB_PROJECT=my-project` |
+| `VERBOSE=1` | Enable visualizations | `0` | `VERBOSE=1` |
+
+### W&B and Visualization Examples
+
+```bash
+# Enable W&B logging
+WANDB=1 bash run_batch_eval.sh gemini swig_action
+
+# Enable visualizations (saves annotated images to results/*/visualizations/)
+VERBOSE=1 bash run_batch_eval.sh gemini swig_action
+
+# Both W&B and visualizations
+WANDB=1 VERBOSE=1 bash run_batch_eval.sh gemini swig_action gemini-3-pro-preview
+
+# Custom W&B project name
+WANDB=1 WANDB_PROJECT=hoi-gemini-eval bash run_batch_eval.sh gemini swig_action
+```
+
+**Note**: Visualizations are limited to the first 100 samples to avoid excessive storage usage. Visualization files are saved as JPG in the `visualizations/` subdirectory of your results folder.
+
+### Full Batch Evaluation Commands
+
+```bash
+# === SWIG Dataset - Cost-Effective Models ===
+
+# SWIG Action Referring - All Providers (default models)
+bash run_batch_eval.sh gemini swig_action
+bash run_batch_eval.sh claude swig_action
+bash run_batch_eval.sh openai swig_action
+
+# SWIG Grounding - All Providers (default models)
+bash run_batch_eval.sh gemini swig_ground
+bash run_batch_eval.sh claude swig_ground
+bash run_batch_eval.sh openai swig_ground
+
+# === SWIG Dataset - Best Accuracy Models ===
+
+# SWIG Action Referring - Top-tier models
+bash run_batch_eval.sh gemini swig_action gemini-3-pro-preview
+bash run_batch_eval.sh claude swig_action claude-opus-4-5
+bash run_batch_eval.sh openai swig_action gpt-5.2-2025-12-11
+
+# SWIG Grounding - Top-tier models
+bash run_batch_eval.sh gemini swig_ground gemini-3-pro-preview
+bash run_batch_eval.sh claude swig_ground claude-opus-4-5
+bash run_batch_eval.sh openai swig_ground gpt-5.2-2025-12-11
+
+# === HICO-DET Dataset - Cost-Effective Models ===
+
+# HICO Action Referring - All Providers (default models)
+bash run_batch_eval.sh gemini hico_action
+bash run_batch_eval.sh claude hico_action
+bash run_batch_eval.sh openai hico_action
+
+# HICO Grounding - All Providers (default models)
+bash run_batch_eval.sh gemini hico_ground
+bash run_batch_eval.sh claude hico_ground
+bash run_batch_eval.sh openai hico_ground
+
+# === HICO-DET Dataset - Best Accuracy Models ===
+
+# HICO Action Referring - Top-tier models
+bash run_batch_eval.sh gemini hico_action gemini-3-pro-preview
+bash run_batch_eval.sh claude hico_action claude-opus-4-5
+bash run_batch_eval.sh openai hico_action gpt-5.2-2025-12-11
+
+# HICO Grounding - Top-tier models
+bash run_batch_eval.sh gemini hico_ground gemini-3-pro-preview
+bash run_batch_eval.sh claude hico_ground claude-opus-4-5
+bash run_batch_eval.sh openai hico_ground gpt-5.2-2025-12-11
+```
+
+---
+
+## Real-time Evaluation Commands (Original)
+
+> **Note:** For large-scale evaluations, use **Batch Processing** above. Real-time mode is better for quick tests or when you need immediate results.
+
 ## SWIG-HOI Evaluation Commands
 
 ### Grounding Task (SWIG)
@@ -281,3 +495,102 @@ Results are saved to `results/` directory:
 - `*_results_*.json` - Raw predictions
 - `*_metrics_*.json` - Computed metrics
 - `*_visualizations/` - Visualization images (when VERBOSE=1)
+
+For batch mode, additional files:
+- `checkpoints/` - Checkpoint files for resumability
+- `batch_requests.json` - Saved batch requests
+- `batch_eval_*.log` - Batch evaluation logs
+
+---
+
+## Project Structure
+
+```
+hoi-benchmarks/
+├── # Batch Processing (NEW - 50% cost savings)
+├── run_batch_eval.sh              # Unified batch evaluation runner
+├── batch_api_utils.py             # Batch API implementations (Claude, Gemini, OpenAI)
+├── checkpoint_manager.py          # Checkpointing for resumability
+├── eval_swig_action_referring_batch.py   # SWIG action batch evaluation
+├── eval_swig_ground_batch.py             # SWIG grounding batch evaluation
+├── eval_hico_action_referring_batch.py   # HICO action batch evaluation
+├── eval_hico_ground_batch.py             # HICO grounding batch evaluation
+│
+├── # Real-time Evaluation (Original)
+├── eval_swig_action_referring_*.py       # SWIG action real-time (claude/gemini/openai)
+├── eval_swig_ground_*.py                 # SWIG grounding real-time
+├── eval_hico_action_referring_*.py       # HICO action real-time
+├── eval_hico_ground_*.py                 # HICO grounding real-time
+├── run_*_eval_*.sh                       # Real-time evaluation shell scripts
+│
+├── # Shared Utilities
+├── eval_api_utils.py              # Shared evaluation utilities
+├── response_cache.py              # Response caching for real-time mode
+├── calculate_bertscore.py         # BERTScore computation
+│
+├── # Configuration
+├── .env                           # API keys (create this file)
+├── pyproject.toml                 # Python dependencies
+└── README.md                      # This file
+```
+
+---
+
+## Troubleshooting
+
+### Batch Job Stuck or Failed
+
+1. Check the checkpoint status:
+```bash
+ls -la results/<task>_<provider>_batch/checkpoints/
+```
+
+2. Resume the job:
+```bash
+RESUME=1 bash run_batch_eval.sh <provider> <task>
+```
+
+3. If the batch expired (>24h), delete checkpoint and restart:
+```bash
+rm -rf results/<task>_<provider>_batch/checkpoints/
+bash run_batch_eval.sh <provider> <task>
+```
+
+### Rate Limit Errors (Real-time Mode)
+
+Switch to **Batch Mode** which uses separate rate limit pools:
+```bash
+bash run_batch_eval.sh <provider> <task>
+```
+
+### API Key Issues
+
+Ensure your `.env` file has the correct keys:
+```bash
+GEMINI_API_KEY=your-gemini-key
+ANTHROPIC_API_KEY=your-claude-key  # or CLAUDE_API_KEY
+OPENAI_API_KEY=your-openai-key     # or OPEN_AI_API_KEY
+```
+
+### Claude Batch "Model Not Found" Errors
+
+If Claude batch jobs complete but all requests fail with "model not found":
+
+1. **Use model aliases**: Use short alias names like `claude-sonnet-4-5` instead of full versioned names
+2. **Confirmed working models**:
+   - `claude-sonnet-4-5` (recommended)
+   - `claude-haiku-4-5` (cheapest)
+   - `claude-opus-4-5` (best accuracy)
+
+3. **Try real-time mode**: If batch fails, use the real-time evaluation scripts instead:
+```bash
+bash run_swig_action_referring_eval_claude.sh claude-sonnet-4-5
+```
+
+---
+
+## References
+
+- [Anthropic Batch API Documentation](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
+- [Google Gemini Batch API Documentation](https://ai.google.dev/gemini-api/docs/batch-api)
+- [OpenAI Batch API Documentation](https://platform.openai.com/docs/guides/batch)
