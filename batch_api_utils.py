@@ -348,7 +348,7 @@ class BatchProcessor:
             "url": "/v1/chat/completions",
             "body": {
                 "model": model,
-                "max_tokens": max_tokens,
+                "max_completion_tokens": max_tokens,  # Note: OpenAI GPT-5+ uses max_completion_tokens instead of max_tokens
                 "messages": [
                     {
                         "role": "user",
@@ -494,8 +494,11 @@ class BatchProcessor:
         # Use inline requests
         inline_requests = [r["request"] for r in requests]
         
+        # Note: Model name should NOT have "models/" prefix for batches.create()
+        model_name = model if not model.startswith("models/") else model.replace("models/", "")
+        
         batch_job = self.client.batches.create(
-            model=f"models/{model}",
+            model=model_name,
             src=inline_requests,
             config={
                 "display_name": display_name or f"hoi-eval-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -521,10 +524,81 @@ class BatchProcessor:
         model: str,
         display_name: Optional[str] = None
     ) -> BatchJob:
-        """Submit large batch to Gemini using file upload."""
+        """Submit large batch to Gemini using file upload with chunking support."""
         from google.genai import types
         
-        # Create JSONL file
+        # Gemini can handle large files but batch job creation may timeout
+        # Use chunking for very large batches to avoid issues
+        MAX_REQUESTS_PER_CHUNK = 5000  # ~300MB per chunk with images
+        
+        if len(requests) > MAX_REQUESTS_PER_CHUNK:
+            print(f"Large batch detected. Splitting into chunks of {MAX_REQUESTS_PER_CHUNK}...", flush=True)
+            
+            batch_ids = []
+            num_chunks = (len(requests) + MAX_REQUESTS_PER_CHUNK - 1) // MAX_REQUESTS_PER_CHUNK
+            model_name = model if not model.startswith("models/") else model.replace("models/", "")
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * MAX_REQUESTS_PER_CHUNK
+                end_idx = min(start_idx + MAX_REQUESTS_PER_CHUNK, len(requests))
+                chunk = requests[start_idx:end_idx]
+                
+                print(f"  Processing chunk {chunk_idx + 1}/{num_chunks} ({len(chunk)} requests)...", flush=True)
+                
+                # Create JSONL file for this chunk
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+                    for req in chunk:
+                        f.write(json.dumps(req) + "\n")
+                    jsonl_path = f.name
+                
+                file_size_mb = os.path.getsize(jsonl_path) / (1024*1024)
+                print(f"    JSONL file: {file_size_mb:.2f} MB", flush=True)
+                
+                try:
+                    # Upload file
+                    print(f"    Uploading...", flush=True)
+                    uploaded_file = self.client.files.upload(
+                        file=jsonl_path,
+                        config=types.UploadFileConfig(
+                            display_name=f"{display_name or 'batch'}_chunk{chunk_idx + 1}",
+                            mime_type='jsonl'
+                        )
+                    )
+                    print(f"    File uploaded: {uploaded_file.name}", flush=True)
+                    
+                    # Create batch job
+                    print(f"    Creating batch job...", flush=True)
+                    batch_job = self.client.batches.create(
+                        model=model_name,
+                        src=uploaded_file.name,
+                        config={
+                            "display_name": f"{display_name or 'hoi-eval'}_chunk{chunk_idx + 1}"
+                        }
+                    )
+                    batch_ids.append(batch_job.name)
+                    print(f"    Batch submitted: {batch_job.name}", flush=True)
+                finally:
+                    os.unlink(jsonl_path)
+            
+            print(f"Submitted {len(batch_ids)} batch jobs", flush=True)
+            
+            # Return a multi-batch job
+            return BatchJob(
+                id=batch_ids[0],  # Primary ID is the first batch
+                provider='gemini',
+                model=model,
+                status=BatchStatus.IN_PROGRESS,
+                created_at=datetime.now(),
+                total_requests=len(requests),
+                metadata={
+                    "display_name": display_name,
+                    "is_multi_batch": True,
+                    "batch_ids": batch_ids,
+                    "num_chunks": num_chunks
+                }
+            )
+        
+        # Single batch for smaller requests
         print(f"Creating JSONL file with {len(requests)} requests...")
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             for idx, req in enumerate(requests):
@@ -547,9 +621,11 @@ class BatchProcessor:
             print(f"File uploaded: {uploaded_file.name}", flush=True)
             
             # Create batch job with file
-            print("Creating batch job...", flush=True)
+            # Note: Model name should NOT have "models/" prefix for batches.create()
+            model_name = model if not model.startswith("models/") else model.replace("models/", "")
+            print(f"Creating batch job with model: {model_name}...", flush=True)
             batch_job = self.client.batches.create(
-                model=f"models/{model}",
+                model=model_name,
                 src=uploaded_file.name,
                 config={
                     "display_name": display_name or f"hoi-eval-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -582,10 +658,68 @@ class BatchProcessor:
         model: str,
         display_name: Optional[str] = None
     ) -> BatchJob:
-        """Submit batch to OpenAI Batch API."""
-        print(f"Submitting {len(requests)} requests to OpenAI Batch API...")
+        """Submit batch to OpenAI Batch API with chunking for large batches."""
+        print(f"Submitting {len(requests)} requests to OpenAI Batch API...", flush=True)
         
-        # Create JSONL file
+        # OpenAI has a 200MB file size limit, so we need to chunk large batches
+        # With base64 images, each request is ~65KB on average, so ~3000 requests per chunk
+        MAX_REQUESTS_PER_CHUNK = 2000  # Conservative to stay under 200MB
+        
+        if len(requests) > MAX_REQUESTS_PER_CHUNK:
+            print(f"Large batch detected. Splitting into chunks of {MAX_REQUESTS_PER_CHUNK}...", flush=True)
+            
+            batch_ids = []
+            num_chunks = (len(requests) + MAX_REQUESTS_PER_CHUNK - 1) // MAX_REQUESTS_PER_CHUNK
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * MAX_REQUESTS_PER_CHUNK
+                end_idx = min(start_idx + MAX_REQUESTS_PER_CHUNK, len(requests))
+                chunk = requests[start_idx:end_idx]
+                
+                print(f"  Submitting chunk {chunk_idx + 1}/{num_chunks} ({len(chunk)} requests)...", flush=True)
+                
+                # Create JSONL file for this chunk
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+                    for req in chunk:
+                        f.write(json.dumps(req) + "\n")
+                    jsonl_path = f.name
+                
+                try:
+                    # Upload file
+                    with open(jsonl_path, 'rb') as f:
+                        batch_file = self.client.files.create(file=f, purpose="batch")
+                    
+                    # Create batch
+                    batch = self.client.batches.create(
+                        input_file_id=batch_file.id,
+                        endpoint="/v1/chat/completions",
+                        completion_window="24h",
+                        metadata={"display_name": f"{display_name or 'hoi-eval'}_chunk{chunk_idx + 1}"}
+                    )
+                    batch_ids.append(batch.id)
+                    print(f"    Batch submitted: {batch.id}", flush=True)
+                finally:
+                    os.unlink(jsonl_path)
+            
+            print(f"Submitted {len(batch_ids)} batch jobs", flush=True)
+            
+            # Return a multi-batch job
+            return BatchJob(
+                id=batch_ids[0],  # Primary ID is the first batch
+                provider='openai',
+                model=model,
+                status=BatchStatus.IN_PROGRESS,
+                created_at=datetime.now(),
+                total_requests=len(requests),
+                metadata={
+                    "display_name": display_name,
+                    "is_multi_batch": True,
+                    "batch_ids": batch_ids,
+                    "num_chunks": num_chunks
+                }
+            )
+        
+        # Single batch for smaller requests
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             for req in requests:
                 f.write(json.dumps(req) + "\n")
@@ -686,6 +820,41 @@ class BatchProcessor:
     
     def _poll_gemini_status(self, job: BatchJob) -> BatchJob:
         """Poll Gemini batch status."""
+        # Handle multi-batch jobs
+        if job.metadata and job.metadata.get("is_multi_batch"):
+            batch_ids = job.metadata.get("batch_ids", [job.id])
+            total_completed = 0
+            total_failed = 0
+            all_completed = True
+            any_failed = False
+            
+            for batch_id in batch_ids:
+                batch = self.client.batches.get(name=batch_id)
+                state_name = batch.state.name if hasattr(batch.state, 'name') else str(batch.state)
+                status = self._map_gemini_status(state_name)
+                
+                if hasattr(batch, 'batch_stats') and batch.batch_stats:
+                    total_completed += getattr(batch.batch_stats, 'successful_request_count', 0) or 0
+                    total_failed += getattr(batch.batch_stats, 'failed_request_count', 0) or 0
+                
+                if status == BatchStatus.FAILED:
+                    any_failed = True
+                if status not in [BatchStatus.COMPLETED, BatchStatus.FAILED]:
+                    all_completed = False
+            
+            job.completed_count = total_completed
+            job.failed_count = total_failed
+            
+            if any_failed:
+                job.status = BatchStatus.FAILED
+            elif all_completed:
+                job.status = BatchStatus.COMPLETED
+            else:
+                job.status = BatchStatus.IN_PROGRESS
+            
+            return job
+        
+        # Single batch
         batch = self.client.batches.get(name=job.id)
         
         state_name = batch.state.name if hasattr(batch.state, 'name') else str(batch.state)
@@ -700,7 +869,48 @@ class BatchProcessor:
     
     def _poll_openai_status(self, job: BatchJob) -> BatchJob:
         """Poll OpenAI batch status."""
+        # Handle multi-batch jobs
+        if job.metadata and job.metadata.get("is_multi_batch"):
+            batch_ids = job.metadata.get("batch_ids", [job.id])
+            total_completed = 0
+            total_failed = 0
+            all_completed = True
+            any_failed = False
+            output_file_ids = []
+            
+            for batch_id in batch_ids:
+                batch = self.client.batches.retrieve(batch_id)
+                status = self._map_openai_status(batch.status)
+                
+                
+                if batch.request_counts:
+                    total_completed += batch.request_counts.completed or 0
+                    total_failed += batch.request_counts.failed or 0
+                
+                if status == BatchStatus.FAILED:
+                    any_failed = True
+                if status not in [BatchStatus.COMPLETED, BatchStatus.FAILED]:
+                    all_completed = False
+                if batch.output_file_id:
+                    output_file_ids.append(batch.output_file_id)
+            
+            job.completed_count = total_completed
+            job.failed_count = total_failed
+            job.metadata["output_file_ids"] = output_file_ids
+            
+            
+            if any_failed:
+                job.status = BatchStatus.FAILED
+            elif all_completed:
+                job.status = BatchStatus.COMPLETED
+            else:
+                job.status = BatchStatus.IN_PROGRESS
+            
+            return job
+        
+        # Single batch
         batch = self.client.batches.retrieve(job.id)
+        
         
         job.status = self._map_openai_status(batch.status)
         job.completed_count = batch.request_counts.completed if batch.request_counts else 0
@@ -808,6 +1018,71 @@ class BatchProcessor:
     def _download_gemini_results(self, job: BatchJob) -> List[Dict[str, Any]]:
         """Download Gemini batch results."""
         results = []
+        
+        # Handle multi-batch jobs
+        if job.metadata and job.metadata.get("is_multi_batch"):
+            batch_ids = job.metadata.get("batch_ids", [job.id])
+            print(f"Downloading results from {len(batch_ids)} Gemini batches...", flush=True)
+            
+            for idx, batch_id in enumerate(batch_ids):
+                print(f"  Downloading batch {idx + 1}/{len(batch_ids)}: {batch_id}...", flush=True)
+                batch = self.client.batches.get(name=batch_id)
+                
+                # Check for file-based results (most common for large batches)
+                if batch.dest and hasattr(batch.dest, 'file_name') and batch.dest.file_name:
+                    file_content = self.client.files.download(file=batch.dest.file_name)
+                    content = file_content.decode('utf-8')
+                    
+                    for line in content.splitlines():
+                        if line.strip():
+                            parsed = json.loads(line)
+                            key = parsed.get("key", "unknown")
+                            
+                            if "response" in parsed and parsed["response"]:
+                                try:
+                                    text = parsed["response"]["candidates"][0]["content"]["parts"][0]["text"]
+                                except (KeyError, IndexError):
+                                    text = str(parsed["response"])
+                                
+                                results.append({
+                                    "custom_id": key,
+                                    "status": "success",
+                                    "response": text
+                                })
+                            elif "error" in parsed:
+                                results.append({
+                                    "custom_id": key,
+                                    "status": "error",
+                                    "error": str(parsed["error"])
+                                })
+                
+                # Check for inline responses
+                elif batch.dest and hasattr(batch.dest, 'inlined_responses') and batch.dest.inlined_responses:
+                    for i, inline_response in enumerate(batch.dest.inlined_responses):
+                        key = f"request-{idx}-{i}"
+                        
+                        if inline_response.response:
+                            try:
+                                text = inline_response.response.text
+                            except:
+                                text = str(inline_response.response)
+                            
+                            results.append({
+                                "custom_id": key,
+                                "status": "success",
+                                "response": text
+                            })
+                        elif hasattr(inline_response, 'error') and inline_response.error:
+                            results.append({
+                                "custom_id": key,
+                                "status": "error",
+                                "error": str(inline_response.error)
+                            })
+            
+            print(f"Downloaded {len(results)} results", flush=True)
+            return results
+        
+        # Single batch
         batch = self.client.batches.get(name=job.id)
         
         # Check for inline responses
@@ -867,6 +1142,53 @@ class BatchProcessor:
         """Download OpenAI batch results."""
         results = []
         
+        # Handle multi-batch jobs
+        if job.metadata and job.metadata.get("is_multi_batch"):
+            batch_ids = job.metadata.get("batch_ids", [job.id])
+            print(f"Downloading results from {len(batch_ids)} batches...", flush=True)
+            
+            for idx, batch_id in enumerate(batch_ids):
+                print(f"  Downloading batch {idx + 1}/{len(batch_ids)}: {batch_id}...", flush=True)
+                batch = self.client.batches.retrieve(batch_id)
+                
+                
+                
+                if batch.output_file_id:
+                    content = self.client.files.content(batch.output_file_id)
+                    
+                    
+                    for line in content.text.splitlines():
+                        if line.strip():
+                            parsed = json.loads(line)
+                            custom_id = parsed.get("custom_id", "unknown")
+                            
+                            if parsed.get("response") and parsed["response"].get("body"):
+                                body = parsed["response"]["body"]
+                                if body.get("choices"):
+                                    text = body["choices"][0]["message"]["content"]
+                                    results.append({
+                                        "custom_id": custom_id,
+                                        "status": "success",
+                                        "response": text,
+                                        "usage": body.get("usage", {})
+                                    })
+                                else:
+                                    results.append({
+                                        "custom_id": custom_id,
+                                        "status": "error",
+                                        "error": "No choices in response"
+                                    })
+                            elif parsed.get("error"):
+                                results.append({
+                                    "custom_id": custom_id,
+                                    "status": "error",
+                                    "error": str(parsed["error"])
+                                })
+            
+            print(f"Downloaded {len(results)} results", flush=True)
+            return results
+        
+        # Single batch
         output_file_id = job.metadata.get("output_file_id")
         if not output_file_id:
             # Re-poll to get output file ID
@@ -903,7 +1225,6 @@ class BatchProcessor:
                             "status": "error",
                             "error": str(parsed["error"])
                         })
-        
         return results
     
     # Status mapping helpers
