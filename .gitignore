@@ -16,3 +16,4 @@ cache/
 .claude/
 wandb/
 gemini-3-pro-preview/
+results-redo/

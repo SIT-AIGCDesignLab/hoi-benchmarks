@@ -353,28 +353,23 @@ def get_box_area(box):
     return (box[2] - box[0]) * (box[3] - box[1])
 
 
-def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
-    """
-    Categorize a ground truth pair by object size.
-    Uses the object box area for categorization (COCO standard).
-    
-    Returns: 'small', 'medium', or 'large'
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216) -> str:
+    """Categorize GT pair by object size using COCO-style absolute pixel thresholds.
+    Small: object < 32**2 pixels²
+    Medium: 32**2 to 96**2 pixels²
+    Large: >= 96**2 pixels²
     """
     object_area = get_box_area(gt_pair['object_box'])
-    
     if object_area < area_small:
         return 'small'
     elif object_area < area_medium:
         return 'medium'
-    else:
-        return 'large'
+    return 'large'
 
 
 def compute_grounding_metrics(all_predictions, all_ground_truth):
     """Compute COCO-style AR metrics."""
     # COCO area thresholds for small/medium/large objects
-    AREA_SMALL = 32 ** 2    # < 1024 pixels²
-    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
     
     recalls = []
     recalls_small = []
@@ -397,6 +392,8 @@ def compute_grounding_metrics(all_predictions, all_ground_truth):
             # Track size-specific metrics
             matched_gt_indices = {m[1] for m in matches}
             for gt_idx, gt_pair in enumerate(gt_pairs):
+                AREA_SMALL = 32 ** 2    # < 1024 pixels²
+                AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
                 size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
                 if gt_idx in matched_gt_indices:
                     # True Positive for this size category

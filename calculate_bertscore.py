@@ -92,6 +92,24 @@ Model Recommendations:
 For short text like action descriptions ("sitting on bench", "riding horse"),
 roberta-large works very well and is the recommended choice.
 
+SFT model results (use _per_triplet.json file, NOT the main results JSON):
+============================================================================
+# SWIG grounding SFT — action referring
+.venv/bin/python calculate_bertscore.py \
+    --model microsoft/deberta-v2-xxlarge-mnli \
+    --input results-redo/swig_action_sft/swig_action_sft_results_TIMESTAMP_per_triplet.json \
+    --gpu 0 --batch-size 64
+
+# HICO action referring SFT
+.venv/bin/python calculate_bertscore.py \
+    --model microsoft/deberta-v2-xxlarge-mnli \
+    --input results-redo/hico_action_sft/hico_action_sft_results_TIMESTAMP_per_triplet.json \
+    --gpu 0 --batch-size 64
+
+Note: The _per_triplet.json has "prediction" and "ground_truth" keys (script defaults).
+      The main results JSON is COCO format (image_id/caption) — NOT compatible.
+      Do NOT use the .log file — it only has printed metrics, not per-prediction data.
+
 Output:
 =======
 The script generates two output files:

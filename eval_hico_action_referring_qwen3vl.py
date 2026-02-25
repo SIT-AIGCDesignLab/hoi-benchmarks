@@ -1,23 +1,21 @@
 """
-SWIG-HOI Action Referring Evaluation Script for Qwen3VL
+HICO-DET Action Referring Evaluation Script for Qwen3VL
 
 Evaluates Qwen3VL action prediction using METEOR and CIDEr metrics.
 
 Task: Given (person, object) bounding boxes, predict the connecting action.
 
-Key Differences from HICO:
-- SWIG actions are in -ing form (e.g., "stirring", "stapling")
-- Supports person-person interactions
+Key Differences from Groma Evaluation:
 - Uses Qwen3VL model instead of Groma
 - Different prompt format (no refer_box tokens)
 - Direct bbox input to model
 - Same metrics: METEOR, CIDEr, BLEU, ROUGE-L
 
 Usage:
-    python groma/eval/eval_swig_action_referring_qwen3vl.py \
+    python groma/eval/eval_hico_action_referring_qwen3vl.py \
         --model-name Qwen/Qwen3-VL-8B-Instruct \
-        --img-prefix /path/to/swig/images_512 \
-        --ann-file data/benchmarks_simplified/swig_action_referring_test_simplified.json \
+        --img-prefix /path/to/hico/images/test2015 \
+        --ann-file groma_data/benchmarks/hico_action_referring_test.json \
         --pred-file results/predictions.json \
         --verbose \
         --max-images 10
@@ -459,7 +457,7 @@ def eval_model(args):
     """Main evaluation function"""
 
     print("=" * 80)
-    print("SWIG-HOI Action Referring Evaluation (Qwen3VL)")
+    print("HICO-DET Action Referring Evaluation (Qwen3VL)")
     print("=" * 80)
     print(f"Model:       {args.model_name}")
     print(f"Device:      {args.device}")
@@ -483,16 +481,16 @@ def eval_model(args):
             wandb.login()
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_run_name or f"swig_action_qwen3vl_{timestamp}",
+                name=args.wandb_run_name or f"hico_action_qwen3vl_{timestamp}",
                 config={
                     "model": args.model_name,
                     "device": args.device,
-                    "dataset": "SWIG-HOI-Action",
+                    "dataset": "HICO-DET-Action",
                     "task": "action_referring",
                     "max_images": args.max_images,
                     "timestamp": timestamp,
                 },
-                tags=["swig", "action-referring", "qwen3vl", "person-person"]
+                tags=["hico", "action-referring", "qwen3vl"]
             )
             print(f"✓ Weights & Biases initialized successfully!")
             print(f"  Run URL: {wandb.run.url}")
@@ -511,48 +509,10 @@ def eval_model(args):
     is_thinking_model = "Thinking" in args.model_name or "thinking" in args.model_name
     print(f"Model type: {'Thinking' if is_thinking_model else 'Instruct'}\n")
 
-    # Load annotations
+    # Load annotations (simplified format: list of dicts with boxes, person_box_idx, etc.)
     print(f"Loading annotations from: {args.ann_file}")
     with open(args.ann_file, 'r') as f:
-        data = json.load(f)
-
-    # Check if it's COCO format or regular format
-    if isinstance(data, dict) and 'images' in data and 'annotations' in data:
-        # COCO format
-        print("Detected COCO format annotation file")
-        images_dict = {img['id']: img for img in data['images']}
-        annotations_dict = {ann['image_id']: ann for ann in data['annotations']}
-
-        # Convert to our format
-        dataset_samples = []
-        for img_id, img_info in images_dict.items():
-            ann = annotations_dict.get(img_id)
-            if ann:
-                dataset_samples.append({
-                    'file_name': img_info['file_name'],
-                    'triplet_id': img_id,
-                    'person_bbox': img_info['subject_bbox'],
-                    'object_bbox': img_info['object_bbox'],
-                    'object_category': img_info.get('object_category', 'object'),
-                    'gt_action': ann['caption']
-                })
-    elif isinstance(data, list):
-        # Regular format (list of samples with conversation)
-        print("Detected regular format annotation file")
-        dataset_samples = []
-        for idx, sample in enumerate(data):
-            box_inds = sample['conversation'][0]['box_inds']
-            boxes = sample['boxes']
-            dataset_samples.append({
-                'file_name': sample['file_name'],
-                'triplet_id': idx,
-                'person_bbox': boxes[box_inds[0]],
-                'object_bbox': boxes[box_inds[1]],
-                'object_category': None,
-                'gt_action': sample['conversation'][1]['value']
-            })
-    else:
-        raise ValueError("Unknown annotation format")
+        dataset_samples = json.load(f)
 
     print(f"Loaded {len(dataset_samples)} action referring triplets")
 
@@ -716,7 +676,7 @@ def eval_model(args):
     import tempfile
     gt_coco_format = {
         'info': {
-            'description': 'SWIG-HOI Action Referring Ground Truth',
+            'description': 'HICO-DET Action Referring Ground Truth',
             'version': '1.0',
             'year': 2025
         },
@@ -752,7 +712,7 @@ def eval_model(args):
 
     # Print results
     print("\n" + "=" * 80)
-    print("SWIG-HOI Action Referring Results (Qwen3VL)")
+    print("HICO-DET Action Referring Results (Qwen3VL)")
     print("=" * 80)
     print(f"{'Metric':<15} {'Score':>10}  {'Description':<50}")
     print("-" * 80)
@@ -896,24 +856,28 @@ def eval_model(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SWIG-HOI Action Referring Evaluation with Qwen3VL")
+    parser = argparse.ArgumentParser(description="HICO-DET Action Referring Evaluation with Qwen3VL")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help="Qwen3VL model name")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device to use (auto, cuda, cuda:0, cuda:1, etc.)")
-    parser.add_argument("--ann-file", type=str, required=True,
-                        help="Path to SWIG action referring annotation file")
-    parser.add_argument("--img-prefix", type=str, required=True,
-                        help="Path to SWIG images directory (images_512)")
+    parser.add_argument("--ann-file", type=str,
+                        default="../dataset/benchmarks_simplified/hico_action_referring_test_simplified.json",
+                        help="Path to HICO action referring annotation file")
+    parser.add_argument("--img-prefix", type=str,
+                        default="../dataset/hico_20160224_det/images/test2015",
+                        help="Path to HICO images directory")
     parser.add_argument("--pred-file", type=str, required=True,
                         help="Output file for predictions")
+    parser.add_argument("--vllm-url", type=str, default=None,
+                        help="URL of running vLLM server (e.g. http://localhost:8000). If set, uses OpenAI client instead of local model.")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Limit evaluation to first N triplets (for testing)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show detailed per-triplet results and generate visualizations")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="swig-action-referring-qwen3vl",
+    parser.add_argument("--wandb-project", type=str, default="hico-action-referring-qwen3vl",
                         help="W&B project name")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name (auto-generated if not provided)")

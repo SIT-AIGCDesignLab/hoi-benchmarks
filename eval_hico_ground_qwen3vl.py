@@ -1,7 +1,7 @@
 """
-SWIG-HOI Grounding Evaluation Script for Qwen3VL (Multi-Pair Format)
+HICO-DET Grounding Evaluation Script for Qwen3VL (Multi-Pair Format)
 
-Evaluates Qwen3VL grounding performance on SWIG-HOI dataset with multi-pair support.
+Evaluates Qwen3VL grounding performance on HICO-DET dataset with multi-pair support.
 
 Key Differences from Groma Evaluation:
 - Uses Qwen3VL model instead of Groma
@@ -9,7 +9,6 @@ Key Differences from Groma Evaluation:
 - Different prompt format (no region tokens)
 - Direct bbox prediction in [0, 1000] format
 - Same metrics: AR (Average Recall) at multiple IoU thresholds
-- Supports person-person interactions
 
 Task: Given "Detect all person-{object} pairs where the person is {action} the {object}",
       predict bounding boxes for ALL person-object pairs performing that action.
@@ -137,25 +136,6 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
         return "", output_text
 
 
-def get_box_area(box):
-    """Calculate area of bounding box [x1, y1, x2, y2]"""
-    return (box[2] - box[0]) * (box[3] - box[1])
-
-
-def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216) -> str:
-    """Categorize GT pair by object size using COCO-style absolute pixel thresholds.
-    Small: object < 32**2 pixels²
-    Medium: 32**2 to 96**2 pixels²
-    Large: >= 96**2 pixels²
-    """
-    object_area = get_box_area(gt_pair['object_box'])
-    if object_area < area_small:
-        return 'small'
-    elif object_area < area_medium:
-        return 'medium'
-    return 'large'
-
-
 def parse_qwen3vl_json_response(response_text, img_shape):
     """
     Parse Qwen3VL JSON response to extract person-object pairs.
@@ -246,6 +226,25 @@ def parse_qwen3vl_json_response(response_text, img_shape):
                 })
 
     return pairs
+
+
+def get_box_area(box):
+    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216) -> str:
+    """Categorize GT pair by object size using COCO-style absolute pixel thresholds.
+    Small: object < 32**2 pixels²
+    Medium: 32**2 to 96**2 pixels²
+    Large: >= 96**2 pixels²
+    """
+    object_area = get_box_area(gt_pair['object_box'])
+    if object_area < area_small:
+        return 'small'
+    elif object_area < area_medium:
+        return 'medium'
+    return 'large'
 
 
 def match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5):
@@ -416,20 +415,9 @@ def visualize_qwen3vl_grounding(image_path, pred_pairs, gt_pairs, matches,
 
     # Draw overlay (right panel) - show both predictions and GT with matching
     for match in matches:
-        # Handle both formats: (pred_idx, gt_idx) or (pred_idx, gt_idx, person_iou, object_iou)
-        if len(match) == 2:
-            pred_idx, gt_idx = match
-            pred_pair = pred_pairs[pred_idx]
-            gt_pair = gt_pairs[gt_idx]
-            person_iou = calculate_iou(pred_pair['person_box'], gt_pair['person_box'])
-        else:
-            pred_idx, gt_idx, person_iou, _ = match
-            pred_pair = pred_pairs[pred_idx]
-            gt_pair = gt_pairs[gt_idx]
-        
-        # Calculate IoU for visualization
-        person_iou = calculate_iou(pred_pair['person_box'], gt_pair['person_box'])
-        object_iou = calculate_iou(pred_pair['object_box'], gt_pair['object_box'])
+        pred_idx, gt_idx, person_iou, object_iou = match
+        pred_pair = pred_pairs[pred_idx]
+        gt_pair = gt_pairs[gt_idx]
 
         # Draw GT in green
         overlay_draw.rectangle(gt_pair['person_box'], outline=(0, 255, 0), width=2)
@@ -634,7 +622,7 @@ def eval_model(args):
     """Main evaluation function"""
 
     print("=" * 80)
-    print("SWIG-HOI Grounding Evaluation (Qwen3VL)")
+    print("HICO-DET Grounding Evaluation (Qwen3VL)")
     print("=" * 80)
     print(f"Model:       {args.model_name}")
     print(f"Device:      {args.device}")
@@ -709,16 +697,16 @@ def eval_model(args):
             # Initialize run
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_run_name or f"swig_ground_qwen3vl_{timestamp}",
+                name=args.wandb_run_name or f"hico_ground_qwen3vl_{timestamp}",
                 config={
                     "model": args.model_name,
                     "device": args.device,
-                    "dataset": "SWIG-HOI-Ground",
+                    "dataset": "HICO-DET-Ground",
                     "task": "multi_pair_grounding",
                     "max_images": args.max_images,
                     "timestamp": timestamp,
                 },
-                tags=["swig", "grounding", "qwen3vl", "multi-pair", "person-person"]
+                tags=["hico", "grounding", "qwen3vl", "multi-pair"]
             )
             print(f"✓ Weights & Biases initialized successfully!")
             print(f"  Run URL: {wandb.run.url}")
@@ -823,7 +811,7 @@ def eval_model(args):
         if show_verbose:
             print(f"\n[Sample {idx+1}/{len(dataset_samples)}] {file_name}")
             print(f"  Action: {action}, Object: {object_category}")
-            print(f"  GT boxes loaded: {len(gt_boxes_list)}, GT pairs: {len(gt_pairs)}")
+            print(f"  GT boxes loaded: {len(boxes)}, GT pairs: {len(gt_pairs)}")
 
         # Build prompt for logging
         prompt_messages = build_qwen3vl_prompt(action, object_category, is_thinking_model)
@@ -966,7 +954,7 @@ def eval_model(args):
 
     # Compute Average Recall (AR) metrics
     print("\n" + "=" * 80)
-    print("SWIG-HOI Grounding Evaluation Results (Qwen3VL)")
+    print("HICO-DET Grounding Evaluation Results (Qwen3VL)")
     print("=" * 80)
 
     # Compute recalls at all IoU thresholds
@@ -1149,24 +1137,28 @@ def eval_model(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SWIG-HOI Grounding Evaluation with Qwen3VL")
+    parser = argparse.ArgumentParser(description="HICO-DET Grounding Evaluation with Qwen3VL")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help="Qwen3VL model name")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device to use (auto, cuda, cuda:0, cuda:1, etc.)")
-    parser.add_argument("--ann-file", type=str, required=True,
-                        help="Path to SWIG grounding annotation file")
-    parser.add_argument("--img-prefix", type=str, required=True,
-                        help="Path to SWIG images directory")
+    parser.add_argument("--ann-file", type=str,
+                        default="../dataset/benchmarks_simplified/hico_ground_test_simplified.json",
+                        help="Path to HICO grounding annotation file")
+    parser.add_argument("--img-prefix", type=str,
+                        default="../dataset/hico_20160224_det/images/test2015",
+                        help="Path to HICO images directory")
     parser.add_argument("--result-file", type=str, required=True,
                         help="Output file for evaluation results")
+    parser.add_argument("--vllm-url", type=str, default=None,
+                        help="URL of running vLLM server (e.g. http://localhost:8000). If set, uses OpenAI client instead of local model.")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Limit evaluation to first N samples (for testing)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show detailed per-sample results")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="swig-grounding-qwen3vl",
+    parser.add_argument("--wandb-project", type=str, default="hico-grounding-qwen3vl",
                         help="W&B project name")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name (auto-generated if not provided)")
