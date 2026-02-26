@@ -7,6 +7,7 @@
 #
 # Environment Variables:
 #   VERBOSE=1, MAX_IMAGES=N, WANDB=1, MAX_TURNS=N, CHECKPOINT_PATH
+#   RESUME=1         Resume from the most recent partial checkpoint in OUTPUT_DIR
 ################################################################################
 
 set -eo pipefail
@@ -85,10 +86,25 @@ fi
 VERBOSE_FLAG=""
 MAX_IMAGES_FLAG=""
 WANDB_FLAG=""
+RESUME_FLAG=""
 
 [ ! -z "$VERBOSE" ] && VERBOSE_FLAG="--verbose"
 [ ! -z "$MAX_IMAGES" ] && MAX_IMAGES_FLAG="--max-images $MAX_IMAGES"
 [ ! -z "$WANDB" ] && WANDB_FLAG="--wandb"
+
+# Resume: find the most recent partial checkpoint and reuse its output file
+if [ ! -z "$RESUME" ]; then
+    PARTIAL_FILE=$(ls -t "$OUTPUT_DIR"/*.json.partial.jsonl 2>/dev/null | head -1)
+    if [ -n "$PARTIAL_FILE" ]; then
+        PRED_FILE="${PARTIAL_FILE%.partial.jsonl}"
+        LOG_FILE="${PRED_FILE//_results_/_evaluation_}.log"
+        RESUME_FLAG="--resume"
+        echo "Resuming from partial checkpoint: $PARTIAL_FILE"
+        echo "Output file: $PRED_FILE"
+    else
+        echo "No partial checkpoint found in $OUTPUT_DIR, starting fresh"
+    fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${SCRIPT_DIR}/.venv/bin/python"
@@ -106,6 +122,7 @@ EVAL_CMD="$PYTHON eval_swig_action_referring_sft_qwen3vl.py \
 [ ! -z "$VERBOSE_FLAG" ] && EVAL_CMD="$EVAL_CMD $VERBOSE_FLAG"
 [ ! -z "$MAX_IMAGES_FLAG" ] && EVAL_CMD="$EVAL_CMD $MAX_IMAGES_FLAG"
 [ ! -z "$WANDB_FLAG" ] && EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
+[ ! -z "$RESUME_FLAG" ] && EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
 
 eval "$EVAL_CMD" 2>&1 | tee "$LOG_FILE"
 

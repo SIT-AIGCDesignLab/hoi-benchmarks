@@ -20,6 +20,7 @@
 #   WANDB=1                Enable Weights & Biases logging
 #   MAX_TURNS=N            Max tool-call turns (default: 5)
 #   CHECKPOINT_PATH        Path to SFT checkpoint (for auto-starting vLLM)
+#   RESUME=1               Resume from the most recent partial checkpoint in OUTPUT_DIR
 ################################################################################
 
 set -e
@@ -121,10 +122,25 @@ fi
 VERBOSE_FLAG=""
 MAX_IMAGES_FLAG=""
 WANDB_FLAG=""
+RESUME_FLAG=""
 
 [ ! -z "$VERBOSE" ] && VERBOSE_FLAG="--verbose" && echo "✓ Verbose mode enabled"
 [ ! -z "$MAX_IMAGES" ] && MAX_IMAGES_FLAG="--max-images $MAX_IMAGES" && echo "✓ Limiting to $MAX_IMAGES images"
 [ ! -z "$WANDB" ] && WANDB_FLAG="--wandb" && echo "✓ WandB logging enabled"
+
+# Resume: find the most recent partial checkpoint and reuse its output file
+if [ ! -z "$RESUME" ]; then
+    PARTIAL_FILE=$(ls -t "$OUTPUT_DIR"/*.json.partial.jsonl 2>/dev/null | head -1)
+    if [ -n "$PARTIAL_FILE" ]; then
+        RESULT_FILE="${PARTIAL_FILE%.partial.jsonl}"
+        LOG_FILE="${RESULT_FILE//_results_/_evaluation_}.log"
+        RESUME_FLAG="--resume"
+        echo "✓ Resuming from partial checkpoint: $PARTIAL_FILE"
+        echo "  Output file: $RESULT_FILE"
+    else
+        echo "No partial checkpoint found in $OUTPUT_DIR, starting fresh"
+    fi
+fi
 
 echo ""
 
@@ -144,6 +160,7 @@ EVAL_CMD="$PYTHON eval_hico_ground_sft_qwen3vl.py \
 [ ! -z "$VERBOSE_FLAG" ] && EVAL_CMD="$EVAL_CMD $VERBOSE_FLAG"
 [ ! -z "$MAX_IMAGES_FLAG" ] && EVAL_CMD="$EVAL_CMD $MAX_IMAGES_FLAG"
 [ ! -z "$WANDB_FLAG" ] && EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
+[ ! -z "$RESUME_FLAG" ] && EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
 
 eval "$EVAL_CMD" 2>&1 | tee "$LOG_FILE"
 

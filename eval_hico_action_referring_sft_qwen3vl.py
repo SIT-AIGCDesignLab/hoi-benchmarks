@@ -365,6 +365,37 @@ def eval_model(args):
     thinking_records = []
     missing_proposals = 0
 
+    # Resume support: load previously completed samples from partial checkpoint
+    partial_file = args.pred_file + ".partial.jsonl"
+    processed_indices: set = set()
+    if args.resume and os.path.exists(partial_file):
+        print(f"\nResuming from partial checkpoint: {partial_file}")
+        loaded = 0
+        with open(partial_file) as _pf:
+            for line in _pf:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    processed_indices.add(rec["idx"])
+                    predictions.append(rec["prediction"])
+                    per_triplet_results.append(rec["triplet_result"])
+                    gt_action = rec["triplet_result"]["ground_truth"]
+                    action_stats[gt_action]["total"] += 1
+                    action_stats[gt_action]["exact_match"] += (1 if rec["triplet_result"]["exact_match"] else 0)
+                    if rec.get("missing_proposal"):
+                        missing_proposals += 1
+                    if rec.get("thinking_record"):
+                        thinking_records.append(rec["thinking_record"])
+                    loaded += 1
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"  Warning: skipping corrupt partial record: {e}")
+        print(f"Loaded {loaded} completed samples, resuming from next unprocessed...")
+    elif args.resume:
+        print(f"No partial checkpoint found at {partial_file}, starting fresh")
+    partial_f = open(partial_file, "a")
+
     show_verbose = args.verbose or len(dataset_samples) <= 100
 
     viz_dir = None
@@ -375,6 +406,8 @@ def eval_model(args):
 
     print("\nStarting evaluation...")
     for idx, sample in enumerate(tqdm(dataset_samples, disable=show_verbose)):
+        if idx in processed_indices:
+            continue
         file_name = sample["file_name"]
         img_path = os.path.join(args.img_prefix, file_name)
         img_width = sample["width"]
@@ -448,6 +481,17 @@ def eval_model(args):
         action_stats[gt_action]["total"] += 1
         action_stats[gt_action]["exact_match"] += (1 if exact_match else 0)
 
+        # Save partial checkpoint for resume capability
+        partial_rec = {
+            "idx": idx,
+            "prediction": predictions[-1],
+            "triplet_result": per_triplet_results[-1],
+            "missing_proposal": 1 if not proposals else 0,
+            "thinking_record": thinking_records[-1] if thinking else None,
+        }
+        partial_f.write(json.dumps(partial_rec) + "\n")
+        partial_f.flush()
+
         # Visualization (verbose mode only)
         if viz_dir is not None:
             base_name = os.path.splitext(file_name)[0]
@@ -475,6 +519,8 @@ def eval_model(args):
                 except Exception as e:
                     if show_verbose:
                         print(f"  Zoom crop save failed (turn {crop_turn}): {e}")
+
+    partial_f.close()
 
     # COCO evaluation
     print("\n" + "=" * 80)
@@ -552,6 +598,11 @@ def eval_model(args):
                 f.write(json.dumps(r) + "\n")
         print(f"Thinking saved: {thinking_file} ({len(thinking_records)} samples)")
 
+    # Remove partial checkpoint on successful completion
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
+        print(f"Partial checkpoint removed: {partial_file}")
+
     if use_wandb:
         wandb.log(metrics)
         wandb.finish()
@@ -577,6 +628,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="hico-action-referring-sft")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from partial checkpoint if available")
 
     args = parser.parse_args()
     eval_model(args)

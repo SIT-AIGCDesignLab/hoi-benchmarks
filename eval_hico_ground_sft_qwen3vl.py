@@ -658,6 +658,39 @@ def eval_model(args):
     thinking_records = []
     missing_proposals = 0
 
+    # Resume support: load previously completed samples from partial checkpoint
+    partial_file = args.result_file + ".partial.jsonl"
+    processed_indices: set = set()
+    if args.resume and os.path.exists(partial_file):
+        print(f"\nResuming from partial checkpoint: {partial_file}")
+        loaded = 0
+        with open(partial_file) as _pf:
+            for line in _pf:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    processed_indices.add(rec["idx"])
+                    per_sample_results.append(rec["sample_result"])
+                    for iou_thr_str, contrib in rec["per_iou"].items():
+                        iou_thr = float(iou_thr_str)
+                        for key, val in contrib.items():
+                            results_per_threshold[iou_thr][key] += val
+                    action = rec["action_key"]
+                    for key, val in rec["action_update"].items():
+                        action_stats[action][key] += val
+                    missing_proposals += rec["missing_proposal"]
+                    if rec.get("thinking_record"):
+                        thinking_records.append(rec["thinking_record"])
+                    loaded += 1
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"  Warning: skipping corrupt partial record: {e}")
+        print(f"Loaded {loaded} completed samples, resuming from next unprocessed...")
+    elif args.resume:
+        print(f"No partial checkpoint found at {partial_file}, starting fresh")
+    partial_f = open(partial_file, "a")
+
     show_verbose = args.verbose or len(dataset_samples) <= 100
 
     viz_dir = None
@@ -668,6 +701,8 @@ def eval_model(args):
 
     print("\nStarting evaluation...")
     for idx, sample in enumerate(tqdm(dataset_samples, disable=show_verbose)):
+        if idx in processed_indices:
+            continue
         file_name = sample["file_name"]
         action = sample["action"]
         object_category = sample["object_category"]
@@ -761,34 +796,72 @@ def eval_model(args):
             "matches_per_threshold": {},
         }
 
+        sample_iou_contribs = {}
+        matched_05 = 0
         for iou_thr in iou_thresholds:
             matches, unmatched_preds, unmatched_gts = match_pairs_greedy(
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
             )
-            results_per_threshold[iou_thr]["tp"] += len(matches)
-            results_per_threshold[iou_thr]["fp"] += len(unmatched_preds)
-            results_per_threshold[iou_thr]["fn"] += len(unmatched_gts)
+            tp = len(matches)
+            fp = len(unmatched_preds)
+            fn = len(unmatched_gts)
+            results_per_threshold[iou_thr]["tp"] += tp
+            results_per_threshold[iou_thr]["fp"] += fp
+            results_per_threshold[iou_thr]["fn"] += fn
 
             matched_gt_indices = {m[1] for m in matches}
+            tp_small = fn_small = tp_medium = fn_medium = tp_large = fn_large = 0
             for gt_idx, gt_pair in enumerate(gt_pairs):
                 AREA_SMALL = 32 ** 2    # < 1024 pixels²
                 AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
                 size_cat = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
                 if gt_idx in matched_gt_indices:
                     results_per_threshold[iou_thr][f"tp_{size_cat}"] += 1
+                    if size_cat == "small": tp_small += 1
+                    elif size_cat == "medium": tp_medium += 1
+                    else: tp_large += 1
                 else:
                     results_per_threshold[iou_thr][f"fn_{size_cat}"] += 1
+                    if size_cat == "small": fn_small += 1
+                    elif size_cat == "medium": fn_medium += 1
+                    else: fn_large += 1
+
+            sample_iou_contribs[str(iou_thr)] = {
+                "tp": tp, "fp": fp, "fn": fn,
+                "tp_small": tp_small, "fn_small": fn_small,
+                "tp_medium": tp_medium, "fn_medium": fn_medium,
+                "tp_large": tp_large, "fn_large": fn_large,
+            }
 
             sample_result["matches_per_threshold"][iou_thr] = {
-                "matched": len(matches),
-                "unmatched_preds": len(unmatched_preds),
-                "unmatched_gts": len(unmatched_gts),
+                "matched": tp,
+                "unmatched_preds": fp,
+                "unmatched_gts": fn,
             }
 
             if iou_thr == 0.5:
-                action_stats[action]["matched_pairs_05"] += len(matches)
+                action_stats[action]["matched_pairs_05"] += tp
+                matched_05 = tp
 
         per_sample_results.append(sample_result)
+
+        # Save partial checkpoint for resume capability
+        partial_rec = {
+            "idx": idx,
+            "sample_result": sample_result,
+            "per_iou": sample_iou_contribs,
+            "action_key": action,
+            "action_update": {
+                "total_samples": 1,
+                "total_gt_pairs": len(gt_pairs),
+                "total_pred_pairs": len(pred_pairs),
+                "matched_pairs_05": matched_05,
+            },
+            "missing_proposal": 1 if not proposals else 0,
+            "thinking_record": thinking_records[-1] if thinking else None,
+        }
+        partial_f.write(json.dumps(partial_rec) + "\n")
+        partial_f.flush()
 
         # Visualization (verbose mode only)
         if viz_dir is not None:
@@ -819,6 +892,8 @@ def eval_model(args):
                 except Exception as e:
                     if show_verbose:
                         print(f"  Zoom crop save failed (turn {crop_turn}): {e}")
+
+    partial_f.close()
 
     # Compute AR metrics
     print("\n" + "=" * 80)
@@ -889,6 +964,11 @@ def eval_model(args):
                 f.write(json.dumps(r) + "\n")
         print(f"Thinking saved: {thinking_file} ({len(thinking_records)} samples)")
 
+    # Remove partial checkpoint on successful completion
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
+        print(f"Partial checkpoint removed: {partial_file}")
+
     if use_wandb:
         wandb.log(metrics)
         wandb.finish()
@@ -926,6 +1006,8 @@ if __name__ == "__main__":
                         help="W&B project name")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from partial checkpoint if available")
 
     args = parser.parse_args()
     eval_model(args)
