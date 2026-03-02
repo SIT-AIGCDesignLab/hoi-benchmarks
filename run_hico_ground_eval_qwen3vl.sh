@@ -85,7 +85,7 @@ fi
 # GPU availability check
 if command -v nvidia-smi &> /dev/null; then
     echo "GPU Information:"
-    nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader | nl -v 0
+    nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader | nl -v 0 || true
     echo ""
 fi
 
