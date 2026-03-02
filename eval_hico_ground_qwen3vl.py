@@ -22,18 +22,19 @@ Output Format (from Qwen3VL):
 Metrics: Pair-level Precision, Recall, F1 @ IoU thresholds (0.5 to 0.95)
 """
 
-import os
-import json
-import re
-import torch
 import argparse
-from tqdm import tqdm
+import base64
+import io
+import json
+import os
+import re
 from collections import defaultdict
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
 
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+import numpy as np
+from openai import OpenAI
+from PIL import Image, ImageDraw, ImageFont
+from tqdm import tqdm
 
 # Weights & Biases for experiment tracking
 try:
@@ -67,7 +68,7 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 
-def extract_response_from_output(generated_ids, input_ids, processor, is_thinking_model=False):
+def extract_response_from_text(response_text, is_thinking_model=False):
     """
     Extract response text from model output, handling both thinking and instruct models.
 
@@ -80,60 +81,24 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
         - Response contains only the final answer (JSON output directly)
         - Returns empty string for thinking content
 
-    Args:
-        generated_ids: Full output token IDs from model.generate() [batch_size, seq_len]
-        input_ids: Input token IDs [batch_size, input_seq_len]
-        processor: Qwen3VL processor
-        is_thinking_model: Whether the model is a thinking model
-
-    Returns:
-        tuple: (thinking_content: str, final_answer: str)
-            - thinking_content: The reasoning process (empty for instruct models)
-            - final_answer: The final response text (JSON for parsing)
     """
-    if is_thinking_model:
-        # Extract only the tokens after input (full generation)
-        output_ids = generated_ids[0][len(input_ids[0]):].tolist()
+    response_text = response_text.strip()
+    if not is_thinking_model:
+        return "", response_text
 
-        # Find </think> token (ID: 151668)
-        try:
-            think_token_id = 151668
-            # Find the last occurrence of </think> token
-            index = len(output_ids) - output_ids[::-1].index(think_token_id)
+    if "</think>" in response_text:
+        thinking_match = re.findall(r"<think>(.*?)</think>", response_text, re.DOTALL)
+        thinking_content = thinking_match[-1].strip() if thinking_match else ""
+        final_answer = response_text.rsplit("</think>", 1)[-1].strip()
+        return thinking_content, final_answer
 
-            # Extract thinking content (before </think>)
-            thinking_content = processor.decode(output_ids[:index-1], skip_special_tokens=True).strip()
+    json_match = re.search(r"\[\s*\{[\s\S]*?\}\s*\]", response_text)
+    if json_match:
+        print("  Warning: No </think> token found, extracted JSON directly")
+        return "", json_match.group(0)
 
-            # Decode only the final answer section (after </think>)
-            final_answer = processor.decode(output_ids[index:], skip_special_tokens=True).strip()
-
-            return thinking_content, final_answer
-        except ValueError:
-            # No </think> token found - try to extract JSON from the response
-            full_text = processor.decode(output_ids, skip_special_tokens=True).strip()
-            print(f"  ⚠️  Warning: No </think> token found, attempting JSON extraction...")
-
-            # Try to find JSON array in the text (common pattern: [{...}, {...}])
-            json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', full_text)
-            if json_match:
-                print(f"  ✓ Found JSON in malformed output")
-                return "", json_match.group(0)
-
-            # No JSON found - return empty array to avoid crash
-            print(f"  ⚠️  Warning: No JSON found in thinking model output, returning empty array")
-            return "", "[]"
-    else:
-        # Instruct model: decode entire output (standard behavior)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):]
-            for in_ids, out_ids in zip(input_ids, generated_ids)
-        ]
-        output_text = processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )[0]
-        return "", output_text
+    print("  Warning: No </think> token or JSON found in thinking model output, returning empty array")
+    return "", "[]"
 
 
 def parse_qwen3vl_json_response(response_text, img_shape):
@@ -546,13 +511,41 @@ def build_qwen3vl_prompt(action, object_category, is_thinking_model=False):
     ]
 
 
-def run_qwen3vl_inference(model, processor, image_path, action, object_category, is_thinking_model=False):
+def image_to_base64(image):
+    """Convert a PIL image to a JPEG data URL."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def get_response_text(response):
+    """Normalize OpenAI client content into plain text."""
+    content = response.choices[0].message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(text)
+            else:
+                text = getattr(item, "text", None)
+                if text:
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
+def run_qwen3vl_inference(client, model_name, image_path, action, object_category, is_thinking_model=False):
     """
     Run Qwen3VL inference for grounding task.
 
     Args:
-        model: Qwen3VL model
-        processor: Qwen3VL processor
+        client: OpenAI-compatible client for vLLM
+        model_name: Model identifier registered in vLLM
         image_path: Path to image file
         action: Action verb
         object_category: Object category name
@@ -563,230 +556,206 @@ def run_qwen3vl_inference(model, processor, image_path, action, object_category,
         output_text: Generated response text (final answer for thinking models)
         image: PIL Image object
     """
-    # Load image
     image = Image.open(image_path).convert('RGB')
-
-    # Build prompt
     messages = build_qwen3vl_prompt(action, object_category, is_thinking_model)
+    prompt_text = messages[0]["content"][1]["text"]
+    request_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_to_base64(image)}},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
 
-    # Replace placeholder with actual image
-    for msg in messages:
-        for content in msg["content"]:
-            if content.get("type") == "image":
-                content["image"] = image
-
-    # Prepare inputs
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt"
-    )
-    inputs = inputs.to(model.device)
-
-    # Generate
-    # Thinking models need more tokens (thinking content + JSON) and sampling enabled
+    request_kwargs = {
+        "model": model_name,
+        "messages": request_messages,
+    }
     if is_thinking_model:
-        max_tokens = 2048
-        gen_kwargs = {
-            'max_new_tokens': max_tokens,
-            'do_sample': True,
-            'temperature': 0.2,
-            'top_p': 0.9,
-            'top_k': 20,
-        }
+        request_kwargs.update(
+            {
+                "max_tokens": 2048,
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "extra_body": {"top_k": 20},
+            }
+        )
     else:
-        max_tokens = 512
-        gen_kwargs = {
-            'max_new_tokens': max_tokens,
-            'do_sample': False,
-            'temperature': None,
-        }
-
-    with torch.inference_mode():
-        generated_ids = model.generate(
-            **inputs,
-            **gen_kwargs
+        request_kwargs.update(
+            {
+                "max_tokens": 512,
+                "temperature": 0.0,
+            }
         )
 
-    # Extract response text (handles both thinking and instruct models)
-    thinking_content, output_text = extract_response_from_output(
-        generated_ids, inputs.input_ids, processor, is_thinking_model
-    )
+    response = client.chat.completions.create(**request_kwargs)
+    raw_text = get_response_text(response)
+    thinking_content, output_text = extract_response_from_text(raw_text, is_thinking_model)
 
     return thinking_content, output_text, image
 
 
 def eval_model(args):
-    """Main evaluation function"""
+    """Main evaluation function."""
+    if not args.vllm_url:
+        raise ValueError("--vllm-url is required for vLLM endpoint inference")
 
     print("=" * 80)
     print("HICO-DET Grounding Evaluation (Qwen3VL)")
     print("=" * 80)
     print(f"Model:       {args.model_name}")
     print(f"Device:      {args.device}")
+    print(f"vLLM URL:    {args.vllm_url}")
     print(f"Annotation:  {args.ann_file}")
     print(f"Images:      {args.img_prefix}")
     print(f"Output:      {args.result_file}")
+    if args.image:
+        print(f"Image filter: {args.image}")
     if args.max_images:
         print(f"Max images:  {args.max_images} (DEBUGGING MODE)")
     print("=" * 80)
     print()
 
-    # Get timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Load Qwen3VL model
-    print(f"Loading Qwen3VL model: {args.model_name}")
-    print(f"Target device: {args.device}")
-
-    # Handle device mapping
-    # When CUDA_VISIBLE_DEVICES is set, we need to use the local device index
-    # e.g., if CUDA_VISIBLE_DEVICES=1, then cuda:0 refers to physical GPU 1
-    if args.device == "auto":
-        device_map = "auto"
-    elif args.device.startswith("cuda"):
-        # Extract device index
-        if ":" in args.device:
-            device_idx = args.device.split(":")[1]
-        else:
-            device_idx = "0"
-
-        # Check if CUDA_VISIBLE_DEVICES is set
-        import os
-        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-
-        if cuda_visible is not None:
-            # When CUDA_VISIBLE_DEVICES is set, use cuda:0 (the first visible device)
-            device_map = {"": "cuda:0"}
-            print(f"  Note: CUDA_VISIBLE_DEVICES={cuda_visible}, using cuda:0 (physical GPU {cuda_visible})")
-        else:
-            # No CUDA_VISIBLE_DEVICES, use specified device directly
-            device_map = {"": f"cuda:{device_idx}"}
-    else:
-        device_map = {"": args.device}
-
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16,
-        device_map=device_map
-    )
-    processor = AutoProcessor.from_pretrained(args.model_name)
-
-    print(f"✓ Model loaded successfully on device: {model.device}")
-
-    # Detect model type (thinking vs instruct)
+    client = OpenAI(base_url=f"{args.vllm_url}/v1", api_key="placeholder")
     is_thinking_model = "Thinking" in args.model_name or "thinking" in args.model_name
     model_type = "Thinking" if is_thinking_model else "Instruct"
-    print(f"✓ Model type: {model_type}")
+    print(f"Model type: {model_type}")
     if is_thinking_model:
-        print(f"  Note: Thinking model detected - will extract final answer after </think> token")
+        print("  Note: Thinking model detected - will extract final answer after </think> token")
     print()
 
-    # Initialize Weights & Biases
     use_wandb = WANDB_AVAILABLE and args.wandb
     if use_wandb:
         print("Initializing Weights & Biases...")
-
-        # Check if user is logged in
         try:
-            # Try to login (will use cached credentials if available)
             wandb.login()
-
-            # Initialize run
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name or f"hico_ground_qwen3vl_{timestamp}",
                 config={
                     "model": args.model_name,
                     "device": args.device,
+                    "vllm_url": args.vllm_url,
                     "dataset": "HICO-DET-Ground",
                     "task": "multi_pair_grounding",
                     "max_images": args.max_images,
                     "timestamp": timestamp,
                 },
-                tags=["hico", "grounding", "qwen3vl", "multi-pair"]
+                tags=["hico", "grounding", "qwen3vl", "multi-pair", "vllm"],
             )
-            print(f"✓ Weights & Biases initialized successfully!")
+            print("WandB initialized successfully")
             print(f"  Run URL: {wandb.run.url}")
             print(f"  Project: {wandb.run.project}")
             print(f"  Run name: {wandb.run.name}\n")
         except Exception as e:
-            print(f"⚠️  Warning: WandB initialization failed: {e}")
-            print(f"  To use WandB, please run: wandb login")
-            print(f"  Continuing evaluation without WandB logging...\n")
+            print(f"Warning: WandB initialization failed: {e}")
+            print("Continuing evaluation without WandB logging...\n")
             use_wandb = False
 
-    # Load annotation file
     print(f"Loading annotations from: {args.ann_file}")
-    with open(args.ann_file, 'r') as f:
+    with open(args.ann_file, "r") as f:
         dataset_samples = json.load(f)
 
     print(f"Loaded {len(dataset_samples)} samples")
 
-    # Limit dataset if requested
+    if args.image:
+        dataset_samples = [sample for sample in dataset_samples if args.image in sample["file_name"]]
+        print(f"After image filter '{args.image}': {len(dataset_samples)} samples")
+
     if args.max_images is not None and args.max_images < len(dataset_samples):
-        print(f"\n⚠️  Limiting evaluation to first {args.max_images} samples")
-        dataset_samples = dataset_samples[:args.max_images]
+        print(f"\nLimiting evaluation to first {args.max_images} samples")
+        dataset_samples = dataset_samples[: args.max_images]
 
     print(f"\nDataset: {len(dataset_samples)} samples")
-    print(f"Each sample = one (action, object) combination")
+    print("Each sample = one (action, object) combination")
     print("=" * 80)
 
-    # Evaluation metrics at different IoU thresholds
-    iou_thresholds_ar = [round(0.5 + 0.05 * i, 2) for i in range(10)]  # [0.5, 0.55, ..., 0.95]
-
-    # COCO area thresholds for small/medium/large objects
-
+    iou_thresholds_ar = [round(0.5 + 0.05 * i, 2) for i in range(10)]
     results_per_threshold = {
         iou_thr: {
-            'tp': 0,  # True positives (matched pairs)
-            'fp': 0,  # False positives (unmatched predictions)
-            'fn': 0,  # False negatives (unmatched GT pairs)
-            'tp_small': 0,
-            'fn_small': 0,
-            'tp_medium': 0,
-            'fn_medium': 0,
-            'tp_large': 0,
-            'fn_large': 0,
+            "tp": 0,
+            "fp": 0,
+            "fn": 0,
+            "tp_small": 0,
+            "fn_small": 0,
+            "tp_medium": 0,
+            "fn_medium": 0,
+            "tp_large": 0,
+            "fn_large": 0,
         }
         for iou_thr in iou_thresholds_ar
     }
-
-    # Per-sample results
     per_sample_results = []
+    action_stats = defaultdict(
+        lambda: {
+            "total_samples": 0,
+            "total_gt_pairs": 0,
+            "total_pred_pairs": 0,
+            "matched_pairs_05": 0,
+        }
+    )
 
-    # Per-action statistics
-    action_stats = defaultdict(lambda: {
-        'total_samples': 0,
-        'total_gt_pairs': 0,
-        'total_pred_pairs': 0,
-        'matched_pairs_05': 0
-    })
+    partial_file = args.result_file + ".partial.jsonl"
+    processed_indices = set()
+    if args.resume and os.path.exists(partial_file):
+        print(f"\nResuming from partial checkpoint: {partial_file}")
+        loaded = 0
+        with open(partial_file, "r") as partial_in:
+            for line in partial_in:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    idx = rec["idx"]
+                    sample_result = rec["sample_result"]
+                    per_iou = rec["per_iou"]
+                    action_key = rec["action_key"]
+                    action_update = rec["action_update"]
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"  Warning: skipping corrupt partial record: {e}")
+                    continue
+
+                processed_indices.add(idx)
+                per_sample_results.append(sample_result)
+                for iou_thr_str, contrib in per_iou.items():
+                    iou_thr = float(iou_thr_str)
+                    for key, value in contrib.items():
+                        results_per_threshold[iou_thr][key] += value
+                for key, value in action_update.items():
+                    action_stats[action_key][key] += value
+                loaded += 1
+
+        print(f"Loaded {loaded} completed samples, resuming from next unprocessed...")
+    elif args.resume:
+        print(f"No partial checkpoint found at {partial_file}, starting fresh")
+
+    partial_f = open(partial_file, "a")
 
     show_verbose = args.verbose or len(dataset_samples) <= 100
-
-    # Create visualization directory if verbose mode
     viz_dir = None
     if show_verbose:
-        viz_dir = args.result_file.replace('.json', '_visualizations')
+        viz_dir = args.result_file.replace(".json", "_visualizations")
         os.makedirs(viz_dir, exist_ok=True)
-        print(f"✓ Visualization directory: {viz_dir}\n")
+        print(f"Visualization directory: {viz_dir}\n")
 
     print("\nStarting evaluation...")
     for idx, sample in enumerate(tqdm(dataset_samples, disable=show_verbose)):
-        file_name = sample['file_name']
-        action = sample['action']
-        object_category = sample['object_category']
-        img_path = os.path.join(args.img_prefix, file_name)
-        img_shape = (sample['height'], sample['width'])
+        if idx in processed_indices:
+            continue
 
-        # Build GT pairs from simplified format
-        # Simplified format uses gt_box_inds to specify which boxes are person/object
-        boxes = sample['boxes']
-        gt_box_inds = sample['gt_box_inds']
-        num_pairs = sample['num_pairs']
+        file_name = sample["file_name"]
+        action = sample["action"]
+        object_category = sample["object_category"]
+        img_path = os.path.join(args.img_prefix, file_name)
+        img_shape = (sample["height"], sample["width"])
+
+        boxes = sample["boxes"]
+        gt_box_inds = sample["gt_box_inds"]
+        num_pairs = sample["num_pairs"]
         gt_pairs = []
 
         for i in range(num_pairs):
@@ -794,32 +763,24 @@ def eval_model(args):
             object_idx = gt_box_inds[i * 2 + 1]
             person_box = boxes[person_idx]
             object_box = boxes[object_idx]
-
-            # Verify boxes are in correct format [x1, y1, x2, y2]
             if not (isinstance(person_box, list) and len(person_box) == 4):
                 print(f"WARNING: Invalid person box format at {file_name}, pair {i}: {person_box}")
                 continue
             if not (isinstance(object_box, list) and len(object_box) == 4):
                 print(f"WARNING: Invalid object box format at {file_name}, pair {i}: {object_box}")
                 continue
-
-            gt_pairs.append({
-                    'person_box': person_box,
-                    'object_box': object_box
-                })
+            gt_pairs.append({"person_box": person_box, "object_box": object_box})
 
         if show_verbose:
-            print(f"\n[Sample {idx+1}/{len(dataset_samples)}] {file_name}")
+            print(f"\n[Sample {idx + 1}/{len(dataset_samples)}] {file_name}")
             print(f"  Action: {action}, Object: {object_category}")
             print(f"  GT boxes loaded: {len(boxes)}, GT pairs: {len(gt_pairs)}")
 
-        # Build prompt for logging
         prompt_messages = build_qwen3vl_prompt(action, object_category, is_thinking_model)
-        prompt_text = prompt_messages[0]['content'][1]['text']  # Extract the text part
+        prompt_text = prompt_messages[0]["content"][1]["text"]
 
-        # Run Qwen3VL inference
-        thinking_content, output_text, image = run_qwen3vl_inference(
-            model, processor, img_path, action, object_category, is_thinking_model
+        thinking_content, output_text, _ = run_qwen3vl_inference(
+            client, args.model_name, img_path, action, object_category, is_thinking_model
         )
 
         if show_verbose:
@@ -828,84 +789,95 @@ def eval_model(args):
                 print(f"  Thinking: {thinking_content[:150]}...")
             print(f"  Response: {output_text[:150]}...")
 
-        # Parse predicted pairs
         pred_pairs = parse_qwen3vl_json_response(output_text, img_shape)
 
         if show_verbose:
             print(f"  Predicted pairs: {len(pred_pairs)}")
 
-        # Update action stats
-        action_stats[action]['total_samples'] += 1
-        action_stats[action]['total_gt_pairs'] += len(gt_pairs)
-        action_stats[action]['total_pred_pairs'] += len(pred_pairs)
+        action_stats[action]["total_samples"] += 1
+        action_stats[action]["total_gt_pairs"] += len(gt_pairs)
+        action_stats[action]["total_pred_pairs"] += len(pred_pairs)
 
-        # Match predictions to GT at different IoU thresholds
         sample_result = {
-            'file_name': file_name,
-            'action': action,
-            'object': object_category,
-            'action_object_id': sample.get('action_object_id', f"{action}_{object_category}"),
-            'num_gt_pairs': len(gt_pairs),
-            'num_pred_pairs': len(pred_pairs),
-            'prompt': prompt_text,
-            'thinking_content': thinking_content,
-            'generated_text': output_text,
-            'matches_per_threshold': {}
+            "file_name": file_name,
+            "action": action,
+            "object": object_category,
+            "action_object_id": sample.get("action_object_id", f"{action}_{object_category}"),
+            "num_gt_pairs": len(gt_pairs),
+            "num_pred_pairs": len(pred_pairs),
+            "prompt": prompt_text,
+            "thinking_content": thinking_content,
+            "generated_text": output_text,
+            "matches_per_threshold": {},
         }
 
+        sample_iou_contribs = {}
+        matched_05 = 0
         for iou_thr in iou_thresholds_ar:
             matches, unmatched_preds, unmatched_gts = match_pairs_greedy(
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
             )
 
-            # Update overall metrics
-            results_per_threshold[iou_thr]['tp'] += len(matches)
-            results_per_threshold[iou_thr]['fp'] += len(unmatched_preds)
-            results_per_threshold[iou_thr]['fn'] += len(unmatched_gts)
+            results_per_threshold[iou_thr]["tp"] += len(matches)
+            results_per_threshold[iou_thr]["fp"] += len(unmatched_preds)
+            results_per_threshold[iou_thr]["fn"] += len(unmatched_gts)
 
-            # Update size-specific metrics
             matched_gt_indices = {m[1] for m in matches}
+            tp_small = fn_small = tp_medium = fn_medium = tp_large = fn_large = 0
             for gt_idx, gt_pair in enumerate(gt_pairs):
-                AREA_SMALL = 32 ** 2    # < 1024 pixels²
-                AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
-                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
+                area_small = 32 ** 2
+                area_medium = 96 ** 2
+                size_category = categorize_pair_by_size(gt_pair, area_small, area_medium)
                 if gt_idx in matched_gt_indices:
-                    # This GT was matched (True Positive for this size category)
-                    results_per_threshold[iou_thr][f'tp_{size_category}'] += 1
+                    results_per_threshold[iou_thr][f"tp_{size_category}"] += 1
+                    if size_category == "small":
+                        tp_small += 1
+                    elif size_category == "medium":
+                        tp_medium += 1
+                    else:
+                        tp_large += 1
                 else:
-                    # This GT was not matched (False Negative for this size category)
-                    results_per_threshold[iou_thr][f'fn_{size_category}'] += 1
+                    results_per_threshold[iou_thr][f"fn_{size_category}"] += 1
+                    if size_category == "small":
+                        fn_small += 1
+                    elif size_category == "medium":
+                        fn_medium += 1
+                    else:
+                        fn_large += 1
 
-            sample_result['matches_per_threshold'][iou_thr] = {
-                'matched': len(matches),
-                'unmatched_preds': len(unmatched_preds),
-                'unmatched_gts': len(unmatched_gts)
+            sample_result["matches_per_threshold"][iou_thr] = {
+                "matched": len(matches),
+                "unmatched_preds": len(unmatched_preds),
+                "unmatched_gts": len(unmatched_gts),
+            }
+            sample_iou_contribs[str(iou_thr)] = {
+                "tp": len(matches),
+                "fp": len(unmatched_preds),
+                "fn": len(unmatched_gts),
+                "tp_small": tp_small,
+                "fn_small": fn_small,
+                "tp_medium": tp_medium,
+                "fn_medium": fn_medium,
+                "tp_large": tp_large,
+                "fn_large": fn_large,
             }
 
             if iou_thr == 0.5:
-                action_stats[action]['matched_pairs_05'] += len(matches)
-
+                action_stats[action]["matched_pairs_05"] += len(matches)
+                matched_05 = len(matches)
                 if show_verbose:
                     print(f"  Matched @ IoU=0.5: {len(matches)}/{len(gt_pairs)}")
 
-        # Generate visualization for IoU=0.5 (moved outside IoU loop to ensure it runs once per sample)
         if viz_dir is not None:
-            # Get matches at IoU=0.5 for visualization
-            matches_05 = sample_result['matches_per_threshold'][0.5]
             matches_05_list, _, _ = match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5)
-
             try:
                 viz_img = visualize_qwen3vl_grounding(
-                    img_path, pred_pairs, gt_pairs, matches_05_list,
-                    action, object_category, iou_threshold=0.5
+                    img_path, pred_pairs, gt_pairs, matches_05_list, action, object_category, iou_threshold=0.5
                 )
 
-                # Save visualization with unique filename including action and object
-                # This prevents overwriting when same image has multiple action-object pairs
                 base_name = os.path.splitext(file_name)[0]
-                # Sanitize action and object names for filename
-                action_safe = action.replace(' ', '_').replace('/', '_')
-                object_safe = object_category.replace(' ', '_').replace('/', '_')
+                action_safe = action.replace(" ", "_").replace("/", "_")
+                object_safe = object_category.replace(" ", "_").replace("/", "_")
                 viz_filename = f"{base_name}_{action_safe}_{object_safe}_viz.jpg"
                 viz_path = os.path.join(viz_dir, viz_filename)
                 viz_img.save(viz_path, quality=90)
@@ -913,23 +885,25 @@ def eval_model(args):
                 if show_verbose:
                     print(f"  Visualization saved: {viz_filename}")
 
-                # Log to WandB if enabled
                 if use_wandb:
                     log_dict = {
                         f"visualization/{idx:04d}_{action_safe}_{object_safe}": wandb.Image(
                             viz_img,
-                            caption=f"{file_name} | {action} {object_category} | Pred:{len(pred_pairs)} GT:{len(gt_pairs)} Matched:{len(matches_05_list)}"
+                            caption=(
+                                f"{file_name} | {action} {object_category} | "
+                                f"Pred:{len(pred_pairs)} GT:{len(gt_pairs)} Matched:{len(matches_05_list)}"
+                            ),
                         )
                     }
 
-                    # Log thinking content if available
                     if thinking_content:
                         log_dict[f"thinking/{idx:04d}_{action_safe}_{object_safe}"] = wandb.Html(
-                            f"<div style='font-family: monospace; white-space: pre-wrap; padding: 10px; background-color: #f5f5f5; border-radius: 5px;'>"
+                            "<div style='font-family: monospace; white-space: pre-wrap; padding: 10px; "
+                            "background-color: #f5f5f5; border-radius: 5px;'>"
                             f"<h3>{file_name} - {action} {object_category}</h3>"
-                            f"<h4>Thinking Process:</h4>"
+                            "<h4>Thinking Process:</h4>"
                             f"{thinking_content}"
-                            f"</div>"
+                            "</div>"
                         )
                         log_dict[f"thinking_length/{idx:04d}"] = len(thinking_content.split())
 
@@ -939,68 +913,75 @@ def eval_model(args):
                     print(f"  Warning: Visualization failed: {e}")
 
         per_sample_results.append(sample_result)
+        partial_f.write(
+            json.dumps(
+                {
+                    "idx": idx,
+                    "sample_result": sample_result,
+                    "per_iou": sample_iou_contribs,
+                    "action_key": action,
+                    "action_update": {
+                        "total_samples": 1,
+                        "total_gt_pairs": len(gt_pairs),
+                        "total_pred_pairs": len(pred_pairs),
+                        "matched_pairs_05": matched_05,
+                    },
+                }
+            )
+            + "\n"
+        )
+        partial_f.flush()
 
-        # Log per-sample metrics to WandB
         if use_wandb:
-            matches_05 = sample_result['matches_per_threshold'][0.5]['matched']
-            recall_05 = matches_05 / len(gt_pairs) if len(gt_pairs) > 0 else 0.0
-            wandb.log({
-                'sample_idx': idx,
-                'recall@0.5': recall_05,
-                'num_pred_pairs': len(pred_pairs),
-                'num_gt_pairs': len(gt_pairs),
-                'num_matched@0.5': matches_05,
-            })
+            recall_05 = matched_05 / len(gt_pairs) if len(gt_pairs) > 0 else 0.0
+            wandb.log(
+                {
+                    "sample_idx": idx,
+                    "recall@0.5": recall_05,
+                    "num_pred_pairs": len(pred_pairs),
+                    "num_gt_pairs": len(gt_pairs),
+                    "num_matched@0.5": matched_05,
+                }
+            )
 
-    # Compute Average Recall (AR) metrics
+    partial_f.close()
+
     print("\n" + "=" * 80)
     print("HICO-DET Grounding Evaluation Results (Qwen3VL)")
     print("=" * 80)
 
-    # Compute recalls at all IoU thresholds
     recalls = []
     recalls_small = []
     recalls_medium = []
     recalls_large = []
 
     for iou_thr in iou_thresholds_ar:
-        # Overall recall
-        tp = results_per_threshold[iou_thr]['tp']
-        fn = results_per_threshold[iou_thr]['fn']
+        tp = results_per_threshold[iou_thr]["tp"]
+        fn = results_per_threshold[iou_thr]["fn"]
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         recalls.append(recall)
 
-        # Small object recall
-        tp_small = results_per_threshold[iou_thr]['tp_small']
-        fn_small = results_per_threshold[iou_thr]['fn_small']
-        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
-        recalls_small.append(recall_small)
+        tp_small = results_per_threshold[iou_thr]["tp_small"]
+        fn_small = results_per_threshold[iou_thr]["fn_small"]
+        recalls_small.append(tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0)
 
-        # Medium object recall
-        tp_medium = results_per_threshold[iou_thr]['tp_medium']
-        fn_medium = results_per_threshold[iou_thr]['fn_medium']
-        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
-        recalls_medium.append(recall_medium)
+        tp_medium = results_per_threshold[iou_thr]["tp_medium"]
+        fn_medium = results_per_threshold[iou_thr]["fn_medium"]
+        recalls_medium.append(tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0)
 
-        # Large object recall
-        tp_large = results_per_threshold[iou_thr]['tp_large']
-        fn_large = results_per_threshold[iou_thr]['fn_large']
-        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
-        recalls_large.append(recall_large)
+        tp_large = results_per_threshold[iou_thr]["tp_large"]
+        fn_large = results_per_threshold[iou_thr]["fn_large"]
+        recalls_large.append(tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0)
 
-    # Compute AR (Average Recall across IoU 0.5:0.95)
     ar = float(np.mean(recalls)) if recalls else 0.0
-    ar_50 = recalls[0] if len(recalls) > 0 else 0.0
+    ar_50 = recalls[0] if recalls else 0.0
     ar_75 = recalls[5] if len(recalls) > 5 else 0.0
-
-    # Compute size-specific AR metrics
     ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
     ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
     ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
 
-    # Create metrics dictionary
     metrics = {
-        "AP": -1.0,  # AP not applicable for recall-only evaluation
+        "AP": -1.0,
         "AP50": ar_50,
         "AP75": ar_75,
         "APs": ar_small,
@@ -1011,92 +992,91 @@ def eval_model(args):
         "ARm": ar_medium,
         "ARl": ar_large,
         "AR@0.5": ar_50,
-        "AR@0.75": ar_75
+        "AR@0.75": ar_75,
     }
 
-    # Print detailed results
     print("\n" + "=" * 80)
     print("Average Recall (AR) Metrics")
     print("=" * 80)
     print(f"{'Metric':<12} {'Value':>10}  {'Description':<50}")
     print("-" * 80)
-    print(f"{'AR':<12} {metrics['AR']*100:>9.1f}%  {'Average Recall @ IoU=0.50:0.95':<50}")
-    print(f"{'AR@0.5':<12} {metrics['AR@0.5']*100:>9.1f}%  {'Average Recall @ IoU=0.50':<50}")
-    print(f"{'AR@0.75':<12} {metrics['AR@0.75']*100:>9.1f}%  {'Average Recall @ IoU=0.75':<50}")
-    print(f"{'ARs':<12} {metrics['ARs']*100:>9.1f}%  {'Average Recall for small objects (area < 32²)':<50}")
-    print(f"{'ARm':<12} {metrics['ARm']*100:>9.1f}%  {'Average Recall for medium objects (32² < area < 96²)':<50}")
-    print(f"{'ARl':<12} {metrics['ARl']*100:>9.1f}%  {'Average Recall for large objects (area > 96²)':<50}")
+    print(f"{'AR':<12} {metrics['AR'] * 100:>9.1f}%  {'Average Recall @ IoU=0.50:0.95':<50}")
+    print(f"{'AR@0.5':<12} {metrics['AR@0.5'] * 100:>9.1f}%  {'Average Recall @ IoU=0.50':<50}")
+    print(f"{'AR@0.75':<12} {metrics['AR@0.75'] * 100:>9.1f}%  {'Average Recall @ IoU=0.75':<50}")
+    print(f"{'ARs':<12} {metrics['ARs'] * 100:>9.1f}%  {'Average Recall for small objects (area < 32^2)':<50}")
+    print(f"{'ARm':<12} {metrics['ARm'] * 100:>9.1f}%  {'Average Recall for medium objects (32^2 < area < 96^2)':<50}")
+    print(f"{'ARl':<12} {metrics['ARl'] * 100:>9.1f}%  {'Average Recall for large objects (area > 96^2)':<50}")
     print("-" * 80)
 
-    # Log to WandB
     if use_wandb:
         wandb.log(metrics)
-        wandb.log({
-            'total_samples': len(dataset_samples),
-            'total_gt_pairs': sum(s['num_gt_pairs'] for s in per_sample_results),
-            'total_pred_pairs': sum(s['num_pred_pairs'] for s in per_sample_results),
-        })
+        wandb.log(
+            {
+                "total_samples": len(dataset_samples),
+                "total_gt_pairs": sum(s["num_gt_pairs"] for s in per_sample_results),
+                "total_pred_pairs": sum(s["num_pred_pairs"] for s in per_sample_results),
+            }
+        )
 
-    # Per-action statistics
     print("\n" + "=" * 80)
     print("Per-Action Statistics (Top 20 by sample count)")
     print("=" * 80)
     print(f"{'Action':<20} {'Samples':>8} {'GT Pairs':>9} {'Pred':>9} {'Matched':>9} {'Recall@0.5':>11}")
     print("-" * 80)
 
-    sorted_actions = sorted(action_stats.items(), key=lambda x: x[1]['total_samples'], reverse=True)
+    sorted_actions = sorted(action_stats.items(), key=lambda x: x[1]["total_samples"], reverse=True)
     for action, stats in sorted_actions[:20]:
-        recall_05 = stats['matched_pairs_05'] / stats['total_gt_pairs'] if stats['total_gt_pairs'] > 0 else 0.0
-        print(f"{action:<20} {stats['total_samples']:>8} {stats['total_gt_pairs']:>9} "
-              f"{stats['total_pred_pairs']:>9} {stats['matched_pairs_05']:>9} {recall_05 * 100:>10.1f}%")
+        recall_05 = stats["matched_pairs_05"] / stats["total_gt_pairs"] if stats["total_gt_pairs"] > 0 else 0.0
+        print(
+            f"{action:<20} {stats['total_samples']:>8} {stats['total_gt_pairs']:>9} "
+            f"{stats['total_pred_pairs']:>9} {stats['matched_pairs_05']:>9} {recall_05 * 100:>10.1f}%"
+        )
 
     print("=" * 80)
 
-    # Save results
-    os.makedirs(os.path.dirname(args.result_file), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.result_file)), exist_ok=True)
 
-    # Save metrics
-    metrics_file = args.result_file.replace('.json', '_metrics.json')
+    metrics_file = args.result_file.replace(".json", "_metrics.json")
     print(f"\nSaving metrics to: {metrics_file}")
-    with open(metrics_file, 'w') as f:
+    with open(metrics_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Save per-sample results
     print(f"Saving per-sample results to: {args.result_file}")
-    with open(args.result_file, 'w') as f:
+    with open(args.result_file, "w") as f:
         json.dump(per_sample_results, f, indent=2)
 
-    # Save per-action stats
-    action_stats_file = args.result_file.replace('.json', '_action_stats.json')
+    action_stats_file = args.result_file.replace(".json", "_action_stats.json")
     print(f"Saving per-action stats to: {action_stats_file}")
     action_stats_dict = {action: stats for action, stats in action_stats.items()}
-    with open(action_stats_file, 'w') as f:
+    with open(action_stats_file, "w") as f:
         json.dump(action_stats_dict, f, indent=2)
 
-    # Save thinking content separately (only for samples with thinking)
-    thinking_file = args.result_file.replace('.json', '_thinking.jsonl')
-    thinking_samples = [s for s in per_sample_results if s.get('thinking_content')]
+    thinking_file = args.result_file.replace(".json", "_thinking.jsonl")
+    thinking_samples = [s for s in per_sample_results if s.get("thinking_content")]
     if thinking_samples:
         print(f"Saving thinking content to: {thinking_file}")
-        with open(thinking_file, 'w') as f:
+        with open(thinking_file, "w") as f:
             for result in thinking_samples:
                 thinking_entry = {
-                    'file_name': result['file_name'],
-                    'action': result['action'],
-                    'object': result['object'],
-                    'thinking_content': result['thinking_content'],
-                    'generated_text': result['generated_text']
+                    "file_name": result["file_name"],
+                    "action": result["action"],
+                    "object": result["object"],
+                    "thinking_content": result["thinking_content"],
+                    "generated_text": result["generated_text"],
                 }
-                f.write(json.dumps(thinking_entry) + '\n')
+                f.write(json.dumps(thinking_entry) + "\n")
         print(f"  Total samples with thinking: {len(thinking_samples)}/{len(per_sample_results)}")
 
-    # Save and log visualizations summary
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
+        print(f"Removed partial checkpoint: {partial_file}")
+
     if viz_dir is not None:
-        viz_count = len([f for f in os.listdir(viz_dir) if f.endswith('.jpg')])
+        viz_count = len([f for f in os.listdir(viz_dir) if f.endswith(".jpg")])
         print(f"\nVisualizations: {viz_dir}/")
-        print(f"  Total images saved: {viz_count} (should match {len(dataset_samples)} samples)")
-        if viz_count != len(dataset_samples):
-            print(f"  ⚠️  WARNING: Expected {len(dataset_samples)} visualizations but got {viz_count}")
+        print(f"  Total images saved: {viz_count} (should match {len(per_sample_results)} samples)")
+        if viz_count != len(per_sample_results):
+            print(f"  WARNING: Expected {len(per_sample_results)} visualizations but got {viz_count}")
 
     if use_wandb:
         wandb.save(metrics_file)
@@ -1105,29 +1085,31 @@ def eval_model(args):
         if thinking_samples:
             wandb.save(thinking_file)
 
-        # Create summary table for top/bottom performing actions
         action_table_data = []
-        sorted_actions = sorted(action_stats.items(), key=lambda x: x[1]['total_samples'], reverse=True)
         for action, stats in sorted_actions[:20]:
-            recall_05 = stats['matched_pairs_05'] / stats['total_gt_pairs'] if stats['total_gt_pairs'] > 0 else 0.0
-            action_table_data.append([
-                action,
-                stats['total_samples'],
-                stats['total_gt_pairs'],
-                stats['total_pred_pairs'],
-                stats['matched_pairs_05'],
-                f"{recall_05:.1%}"
-            ])
-
-        wandb.log({
-            "action_performance_table": wandb.Table(
-                columns=["Action", "Samples", "GT Pairs", "Pred Pairs", "Matched@0.5", "Recall@0.5"],
-                data=action_table_data
+            recall_05 = stats["matched_pairs_05"] / stats["total_gt_pairs"] if stats["total_gt_pairs"] > 0 else 0.0
+            action_table_data.append(
+                [
+                    action,
+                    stats["total_samples"],
+                    stats["total_gt_pairs"],
+                    stats["total_pred_pairs"],
+                    stats["matched_pairs_05"],
+                    f"{recall_05:.1%}",
+                ]
             )
-        })
+
+        wandb.log(
+            {
+                "action_performance_table": wandb.Table(
+                    columns=["Action", "Samples", "GT Pairs", "Pred Pairs", "Matched@0.5", "Recall@0.5"],
+                    data=action_table_data,
+                )
+            }
+        )
 
         wandb.finish()
-        print("✓ WandB logging complete")
+        print("WandB logging complete")
 
     print("\n" + "=" * 80)
     print("Evaluation complete!")
@@ -1138,30 +1120,41 @@ def eval_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HICO-DET Grounding Evaluation with Qwen3VL")
-    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
-                        help="Qwen3VL model name")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device to use (auto, cuda, cuda:0, cuda:1, etc.)")
-    parser.add_argument("--ann-file", type=str,
-                        default="../dataset/benchmarks_simplified/hico_ground_test_simplified.json",
-                        help="Path to HICO grounding annotation file")
-    parser.add_argument("--img-prefix", type=str,
-                        default="../dataset/hico_20160224_det/images/test2015",
-                        help="Path to HICO images directory")
-    parser.add_argument("--result-file", type=str, required=True,
-                        help="Output file for evaluation results")
-    parser.add_argument("--vllm-url", type=str, default=None,
-                        help="URL of running vLLM server (e.g. http://localhost:8000). If set, uses OpenAI client instead of local model.")
-    parser.add_argument("--max-images", type=int, default=None,
-                        help="Limit evaluation to first N samples (for testing)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Show detailed per-sample results")
-    parser.add_argument("--wandb", action="store_true",
-                        help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="hico-grounding-qwen3vl",
-                        help="W&B project name")
-    parser.add_argument("--wandb-run-name", type=str, default=None,
-                        help="W&B run name (auto-generated if not provided)")
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-8B-Instruct", help="Qwen3VL model name")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use (kept for compatibility; inference now uses the vLLM endpoint)",
+    )
+    parser.add_argument(
+        "--ann-file",
+        type=str,
+        default="../dataset/benchmarks_simplified/hico_ground_test_simplified.json",
+        help="Path to HICO grounding annotation file",
+    )
+    parser.add_argument(
+        "--img-prefix",
+        type=str,
+        default="../dataset/hico_20160224_det/images/test2015",
+        help="Path to HICO images directory",
+    )
+    parser.add_argument("--result-file", type=str, required=True, help="Output file for evaluation results")
+    parser.add_argument("--vllm-url", type=str, default=None, help="URL of running vLLM server")
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Filter samples to those whose file_name contains this string",
+    )
+    parser.add_argument("--max-images", type=int, default=None, help="Limit evaluation to first N samples")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed per-sample results")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="hico-grounding-qwen3vl", help="W&B project name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--resume", action="store_true", help="Resume from partial checkpoint if available")
+
+    eval_model(parser.parse_args())
 
     args = parser.parse_args()
 

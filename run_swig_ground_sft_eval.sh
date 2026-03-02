@@ -13,6 +13,7 @@
 #   bash run_swig_ground_sft_eval.sh 0 http://localhost:8000
 #   MAX_IMAGES=10 VERBOSE=1 bash run_swig_ground_sft_eval.sh 0
 #   WANDB=1 bash run_swig_ground_sft_eval.sh 0
+#   IMAGE_ID=tattooing_86.jpg bash run_swig_ground_sft_eval.sh 0
 #
 # Environment Variables:
 #   VERBOSE=1              Show per-sample results
@@ -21,6 +22,7 @@
 #   MAX_TURNS=N            Max tool-call turns (default: 5)
 #   CHECKPOINT_PATH        Path to SFT checkpoint (for auto-starting vLLM)
 #   RESUME=1               Resume from the most recent partial checkpoint in OUTPUT_DIR
+#   IMAGE_ID=<filename>    Run only samples matching this image filename (e.g. tattooing_86.jpg)
 ################################################################################
 
 set -e
@@ -29,7 +31,7 @@ GPU_ID="${1:-0}"
 VLLM_URL="${2:-http://localhost:8000}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B}"
 # GPU server (RTX 6000 Ada): CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/d/Work/latest_checkpoints/sft-checkpoints/qwen3VL-4B}"
-OUTPUT_DIR="${OUTPUT_DIR:-results-redo/swig_ground_sft}"
+OUTPUT_DIR="${OUTPUT_DIR:-results-sft/swig_ground_sft}"
 MAX_TURNS="${MAX_TURNS:-5}"
 
 if [[ "$GPU_ID" == cuda:* ]]; then
@@ -123,10 +125,12 @@ VERBOSE_FLAG=""
 MAX_IMAGES_FLAG=""
 WANDB_FLAG=""
 RESUME_FLAG=""
+IMAGE_FLAG=""
 
 [ ! -z "$VERBOSE" ] && VERBOSE_FLAG="--verbose" && echo "✓ Verbose mode enabled"
 [ ! -z "$MAX_IMAGES" ] && MAX_IMAGES_FLAG="--max-images $MAX_IMAGES" && echo "✓ Limiting to $MAX_IMAGES images"
 [ ! -z "$WANDB" ] && WANDB_FLAG="--wandb" && echo "✓ WandB logging enabled"
+[ ! -z "$IMAGE_ID" ] && IMAGE_FLAG="--image $IMAGE_ID" && echo "✓ Image filter: $IMAGE_ID"
 
 # Resume: find the most recent partial checkpoint and reuse its output file
 if [ ! -z "$RESUME" ]; then
@@ -161,6 +165,7 @@ EVAL_CMD="$PYTHON eval_swig_ground_sft_qwen3vl.py \
 [ ! -z "$MAX_IMAGES_FLAG" ] && EVAL_CMD="$EVAL_CMD $MAX_IMAGES_FLAG"
 [ ! -z "$WANDB_FLAG" ] && EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
 [ ! -z "$RESUME_FLAG" ] && EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
+[ ! -z "$IMAGE_FLAG" ] && EVAL_CMD="$EVAL_CMD $IMAGE_FLAG"
 
 eval "$EVAL_CMD" 2>&1 | tee "$LOG_FILE"
 

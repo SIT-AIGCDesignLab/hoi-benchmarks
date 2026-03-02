@@ -599,6 +599,8 @@ def eval_model(args):
     print(f"Output:      {args.result_file}")
     if args.max_images:
         print(f"Max images:  {args.max_images} (DEBUGGING MODE)")
+    if args.image:
+        print(f"Image filter: {args.image}")
     print("=" * 80)
     print()
 
@@ -634,6 +636,9 @@ def eval_model(args):
         dataset_samples = json.load(f)
     print(f"Loaded {len(dataset_samples)} samples")
 
+    if args.image:
+        dataset_samples = [s for s in dataset_samples if args.image in s["file_name"]]
+        print(f"After image filter '{args.image}': {len(dataset_samples)} samples")
     if args.max_images:
         dataset_samples = dataset_samples[:args.max_images]
     print(f"Evaluating {len(dataset_samples)} samples")
@@ -994,6 +999,8 @@ if __name__ == "__main__":
                         help="Path to directory containing YOLOE proposal JSON files")
     parser.add_argument("--result-file", type=str, required=True,
                         help="Output file for evaluation results")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Filter samples to those whose file_name contains this string (e.g. 'HICO_test2015_00000001.jpg')")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Limit evaluation to first N samples")
     parser.add_argument("--max-turns", type=int, default=5,

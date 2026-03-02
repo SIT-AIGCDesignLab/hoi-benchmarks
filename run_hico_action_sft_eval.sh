@@ -5,9 +5,13 @@
 # Usage:
 #   bash run_hico_action_sft_eval.sh [GPU_ID] [VLLM_URL] [CHECKPOINT_PATH]
 #
+#   MAX_IMAGES=10 VERBOSE=1 bash run_hico_action_sft_eval.sh 0
+#   WANDB=1 VERBOSE=1 bash run_hico_action_sft_eval.sh 0
+#   IMAGE_ID=HICO_test2015_00003584.jpg bash run_hico_action_sft_eval.sh 0
 # Environment Variables:
 #   VERBOSE=1, MAX_IMAGES=N, WANDB=1, MAX_TURNS=N, CHECKPOINT_PATH
 #   RESUME=1         Resume from the most recent partial checkpoint in OUTPUT_DIR
+#   IMAGE_ID=<filename>  Run only samples matching this image filename
 ################################################################################
 
 set -eo pipefail
@@ -16,7 +20,7 @@ GPU_ID="${1:-0}"
 VLLM_URL="${2:-http://localhost:8000}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B}"
 # GPU server (RTX 6000 Ada): CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/d/Work/latest_checkpoints/sft-checkpoints/qwen3VL-4B}"
-OUTPUT_DIR="${OUTPUT_DIR:-results-redo/hico_action_sft}"
+OUTPUT_DIR="${OUTPUT_DIR:-results-sft/hico_action_sft}"
 MAX_TURNS="${MAX_TURNS:-5}"
 
 if [[ "$GPU_ID" == cuda:* ]]; then
@@ -87,10 +91,12 @@ VERBOSE_FLAG=""
 MAX_IMAGES_FLAG=""
 WANDB_FLAG=""
 RESUME_FLAG=""
+IMAGE_FLAG=""
 
 [ ! -z "$VERBOSE" ] && VERBOSE_FLAG="--verbose"
 [ ! -z "$MAX_IMAGES" ] && MAX_IMAGES_FLAG="--max-images $MAX_IMAGES"
 [ ! -z "$WANDB" ] && WANDB_FLAG="--wandb"
+[ ! -z "$IMAGE_ID" ] && IMAGE_FLAG="--image $IMAGE_ID"
 
 # Resume: find the most recent partial checkpoint and reuse its output file
 if [ ! -z "$RESUME" ]; then
@@ -123,6 +129,7 @@ EVAL_CMD="$PYTHON eval_hico_action_referring_sft_qwen3vl.py \
 [ ! -z "$MAX_IMAGES_FLAG" ] && EVAL_CMD="$EVAL_CMD $MAX_IMAGES_FLAG"
 [ ! -z "$WANDB_FLAG" ] && EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
 [ ! -z "$RESUME_FLAG" ] && EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
+[ ! -z "$IMAGE_FLAG" ] && EVAL_CMD="$EVAL_CMD $IMAGE_FLAG"
 
 eval "$EVAL_CMD" 2>&1 | tee "$LOG_FILE"
 

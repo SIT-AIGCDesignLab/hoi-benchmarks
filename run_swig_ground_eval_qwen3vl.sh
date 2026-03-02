@@ -41,6 +41,9 @@
 # Environment Variables:
 #   VERBOSE=1         Show per-image results
 #   MAX_IMAGES=N      Limit to first N images (for quick testing)
+#   VLLM_URL          URL of a running vLLM server (required)
+#   RESUME=1          Resume from the latest partial checkpoint in OUTPUT_DIR
+#   IMAGE_ID=<file>   Run only samples matching this image filename
 #   WANDB=1           Enable Weights & Biases logging
 #   WANDB_PROJECT     W&B project name (default: swig-grounding-qwen3vl)
 #   WANDB_RUN_NAME    W&B run name (default: auto-generated)
@@ -91,6 +94,17 @@ IMG_PREFIX="${SWIG_ROOT}/images_512"
 ANN_FILE="data/benchmarks_simplified/swig_ground_test_simplified.json"
 RESULT_FILE="${OUTPUT_DIR}/swig_ground_qwen3vl_results_${TIMESTAMP}.json"
 
+if [ -z "$VLLM_URL" ]; then
+    echo "ERROR: VLLM_URL is required (for example: http://localhost:8000)"
+    exit 1
+fi
+
+if ! curl -s "${VLLM_URL}/health" > /dev/null 2>&1; then
+    echo "ERROR: vLLM server is not reachable at $VLLM_URL"
+    echo "Start vLLM manually, then rerun this script."
+    exit 1
+fi
+
 # GPU availability check (optional, shows info but doesn't fail)
 if command -v nvidia-smi &> /dev/null; then
     echo "GPU Information:"
@@ -136,6 +150,8 @@ echo ""
 VERBOSE_FLAG=""
 MAX_IMAGES_FLAG=""
 WANDB_FLAG=""
+RESUME_FLAG=""
+IMAGE_FLAG=""
 
 if [ ! -z "$VERBOSE" ]; then
     VERBOSE_FLAG="--verbose"
@@ -145,6 +161,11 @@ fi
 if [ ! -z "$MAX_IMAGES" ]; then
     MAX_IMAGES_FLAG="--max-images $MAX_IMAGES"
     echo "✓ Limiting to first $MAX_IMAGES images"
+fi
+
+if [ ! -z "$IMAGE_ID" ]; then
+    IMAGE_FLAG="--image $IMAGE_ID"
+    echo "✓ Image filter: $IMAGE_ID"
 fi
 
 if [ ! -z "$WANDB" ]; then
@@ -165,12 +186,26 @@ if [ ! -z "$WANDB" ]; then
     fi
 fi
 
+if [ ! -z "$RESUME" ]; then
+    PARTIAL_FILE=$(ls -t "$OUTPUT_DIR"/*.json.partial.jsonl 2>/dev/null | head -1)
+    if [ -n "$PARTIAL_FILE" ]; then
+        RESULT_FILE="${PARTIAL_FILE%.partial.jsonl}"
+        LOG_FILE="${RESULT_FILE//_results_/_evaluation_}.log"
+        RESUME_FLAG="--resume"
+        echo "✓ Resuming from partial checkpoint: $PARTIAL_FILE"
+        echo "  Output file: $RESULT_FILE"
+    else
+        echo "No partial checkpoint found in $OUTPUT_DIR, starting fresh"
+    fi
+fi
+
 echo ""
 
 # Build evaluation command
-EVAL_CMD="python3 groma/eval/eval_swig_ground_qwen3vl.py \
+EVAL_CMD="python3 eval_swig_ground_qwen3vl.py \
     --model-name \"$MODEL_NAME\" \
     --device $DEVICE_ARG \
+    --vllm-url \"$VLLM_URL\" \
     --ann-file $ANN_FILE \
     --img-prefix $IMG_PREFIX \
     --result-file $RESULT_FILE"
@@ -186,6 +221,14 @@ fi
 
 if [ ! -z "$WANDB_FLAG" ]; then
     EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
+fi
+
+if [ ! -z "$RESUME_FLAG" ]; then
+    EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
+fi
+
+if [ ! -z "$IMAGE_FLAG" ]; then
+    EVAL_CMD="$EVAL_CMD $IMAGE_FLAG"
 fi
 
 # Execute the command

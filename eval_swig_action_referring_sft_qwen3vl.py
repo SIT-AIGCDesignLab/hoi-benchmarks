@@ -330,6 +330,8 @@ def eval_model(args):
     print(f"Output:      {args.pred_file}")
     if args.max_images:
         print(f"Max images:  {args.max_images} (DEBUGGING MODE)")
+    if args.image:
+        print(f"Image filter: {args.image}")
     print("=" * 80)
     print()
 
@@ -355,6 +357,9 @@ def eval_model(args):
         dataset_samples = json.load(f)
     print(f"Loaded {len(dataset_samples)} triplets")
 
+    if args.image:
+        dataset_samples = [s for s in dataset_samples if args.image in s["file_name"]]
+        print(f"After image filter '{args.image}': {len(dataset_samples)} triplets")
     if args.max_images:
         dataset_samples = dataset_samples[:args.max_images]
     print(f"Evaluating {len(dataset_samples)} triplets")
@@ -623,6 +628,8 @@ if __name__ == "__main__":
                         default="../../hoi-dataset-curation/output/test_proposals")
     parser.add_argument("--pred-file", type=str, required=True)
     parser.add_argument("--max-images", type=int, default=None)
+    parser.add_argument("--image", type=str, default=None,
+                        help="Filter samples to those whose file_name contains this string (e.g. 'tattooing_86.jpg')")
     parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wandb", action="store_true")
