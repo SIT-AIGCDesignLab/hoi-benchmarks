@@ -225,7 +225,7 @@ def parse_judge_response(response_text: str) -> Dict[str, Any]:
             # Try parsing the whole text
             return json.loads(response_text)
     except json.JSONDecodeError:
-        return {"score": 0, "reason": "Failed to parse JSON response", "raw_response": response_text[:500]}
+        return {"score": None, "reason": "Failed to parse JSON response", "raw_response": response_text[:500]}
 
 
 def sanitize_custom_id(custom_id: str, max_length: int = 64) -> str:
@@ -238,6 +238,11 @@ def sanitize_custom_id(custom_id: str, max_length: int = 64) -> str:
     sanitized = sanitized.strip('_')
     # Truncate to max length
     return sanitized[:max_length] if sanitized else "sample_0"
+
+
+def make_request_key(item: dict, idx: int) -> str:
+    """Generate a consistent request key for a prediction item."""
+    return sanitize_custom_id(str(item.get("sample_id", idx)))
 
 
 # =============================================================================
@@ -331,7 +336,7 @@ def judge_single(
     Returns a result dict with custom_id, status, and response or error.
     Retries once on failure after a 1-second delay.
     """
-    key = sanitize_custom_id(item.get("sample_id", idx))
+    key = make_request_key(item, idx)
     prompt = construct_eval_prompt(item["ground_truth"], item["prediction"])
 
     def _call() -> str:
@@ -402,7 +407,7 @@ def run_concurrent_judging(
     # Determine which samples still need processing
     pending = [
         (idx, item) for idx, item in enumerate(predictions)
-        if sanitize_custom_id(item.get("sample_id", idx)) not in checkpoint
+        if make_request_key(item, idx) not in checkpoint
     ]
     total = len(predictions)
     already_done = total - len(pending)
@@ -427,7 +432,11 @@ def run_concurrent_judging(
 
         for future in progress:
             idx, item = future_to_idx[future]
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as exc:
+                key = make_request_key(item, idx)
+                result = {"custom_id": key, "status": "error", "error": f"Unexpected error: {exc}"}
             new_results[result["custom_id"]] = result
             new_completions += 1
 
@@ -488,15 +497,19 @@ def merge_and_save(
         if judge_result and judge_result["status"] == "success":
             eval_data = parse_judge_response(judge_result["response"])
 
-            result_item["judge_score"] = eval_data.get("score")
             result_item["judge_reason"] = eval_data.get("reason")
 
             if eval_data.get("raw_response"):
                 result_item["judge_raw_response"] = eval_data["raw_response"]
 
-            if isinstance(result_item["judge_score"], (int, float)):
-                total_score += result_item["judge_score"]
+            score = eval_data.get("score")
+            if isinstance(score, (int, float)) and score is not None:
+                score = max(1, min(10, int(score)))
+                result_item["judge_score"] = score
+                total_score += score
                 valid_scores += 1
+            else:
+                result_item["judge_score"] = score
         else:
             error_msg = (
                 judge_result.get("error", "Result not found")
@@ -624,15 +637,12 @@ def main() -> None:
     import urllib.request
     import urllib.error
 
-    models_url = args.base_url.rstrip("/") + "/../models"
-    # Normalise: base_url is like http://host:port/v1
-    # The models endpoint is http://host:port/v1/models
     models_url = args.base_url.rstrip("/") + "/models"
     try:
         with urllib.request.urlopen(models_url, timeout=10) as resp:
             resp.read()
         print(f"vLLM server reachable at {args.base_url}")
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
         print(f"\nError: Cannot reach vLLM server at {args.base_url}")
         print(f"  Reason: {e.reason if hasattr(e, 'reason') else e}")
         print("\nStart the server with:")
@@ -655,7 +665,7 @@ def main() -> None:
 
     # Build request keys (same logic as judge_single)
     request_keys = [
-        sanitize_custom_id(item.get("sample_id", idx))
+        make_request_key(item, idx)
         for idx, item in enumerate(predictions)
     ]
 
@@ -691,7 +701,6 @@ def main() -> None:
     )
 
     # Load metrics for W&B logging
-    metrics_path = results_path.replace(".json", "").rsplit("_", 1)[0]
     # Find the matching metrics file
     timestamp_str = os.path.basename(results_path).split("_judge_opensource_")[1].replace(".json", "")
     metrics_file = os.path.join(
