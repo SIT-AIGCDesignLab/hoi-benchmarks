@@ -651,6 +651,10 @@ def main() -> None:
         print("\nStart the server with:")
         print("  python -m vllm.entrypoints.openai.api_server \\")
         print(f"      --model {args.model} \\")
+        print("      --quantization fp8 \\")
+        print("      --gpu-memory-utilization 0.90 \\")
+        print("      --max-model-len 32768 \\")
+        print("      --trust-remote-code \\")
         print("      --port 8000")
         sys.exit(1)
 
