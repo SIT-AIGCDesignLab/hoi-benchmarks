@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an evaluation framework for benchmarking Vision-Language Models on Human-Object Interaction (HOI) tasks using the SWIG-HOI dataset. It evaluates the **Qwen3VL model family** on two complementary tasks:
+This is an evaluation framework for benchmarking Vision-Language Models on Human-Object Interaction (HOI) tasks using the **HICO-DET** and **SWIG-HOI** datasets. It evaluates two model families:
+
+1. **Qwen3VL baseline** (Instruct/Thinking, 8B/32B) — direct inference via local GPU
+2. **SFT-trained Qwen3VL tool-use agent** — served via vLLM, uses `zoom_in`/`zoom_out` tool calls for iterative visual inspection
+
+Two complementary tasks:
 
 1. **Action Referring**: Given person and object bounding boxes, predict the connecting action verb (e.g., "riding", "stirring")
 2. **Grounding**: Given an action description and object category, detect all person-object pair bounding boxes in the image
@@ -124,6 +129,74 @@ python eval_llm_judge_opensource.py \
 | `WANDB_RUN_NAME` | auto | W&B run name |
 | `BASE_URL` | `http://localhost:8000/v1` | Override vLLM server URL |
 
+### Running SFT Tool-Use Agent Evaluation
+
+Evaluates a SFT-trained Qwen3VL checkpoint that uses `zoom_in`/`zoom_out` tool calls.
+Requires a vLLM server running with the SFT checkpoint.
+
+```bash
+# SWIG-HOI Action Referring (SFT agent)
+bash run_swig_action_sft_eval.sh 0
+bash run_swig_action_sft_eval.sh 0 http://localhost:8000
+
+# SWIG-HOI Grounding (SFT agent)
+bash run_swig_ground_sft_eval.sh 0
+
+# HICO-DET Action Referring (SFT agent)
+bash run_hico_action_sft_eval.sh 0
+
+# HICO-DET Grounding (SFT agent)
+bash run_hico_ground_sft_eval.sh 0
+
+# Quick test with verbose
+MAX_IMAGES=10 VERBOSE=1 bash run_swig_action_sft_eval.sh 0
+
+# Run single image
+IMAGE_ID=tattooing_86.jpg bash run_swig_action_sft_eval.sh 0
+
+# Resume interrupted run
+RESUME=1 bash run_swig_action_sft_eval.sh 0
+```
+
+**Key environment variables for SFT eval:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VERBOSE=1` | off | Per-sample results |
+| `MAX_IMAGES=N` | all | Limit samples |
+| `MAX_TURNS=N` | 5 | Max tool-call turns |
+| `CHECKPOINT_PATH` | local path | SFT checkpoint for auto-starting vLLM |
+| `RESUME=1` | off | Resume from latest `.json.partial.jsonl` |
+| `IMAGE_ID=<file>` | — | Run only samples matching this filename |
+| `WANDB=1` | off | W&B logging |
+
+**Default checkpoint paths:**
+- Local: `/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B`
+- GPU server (RTX 6000 Ada): `/mnt/d/Work/latest_checkpoints/sft-checkpoints/qwen3VL-4B`
+
+**Output directory:** `results-sft/{swig,hico}_{action,ground}_sft/`
+
+### Running HICO-DET Baseline Evaluation
+
+```bash
+# HICO-DET Action Referring (Qwen3VL baseline, via vLLM)
+bash run_hico_action_referring_eval_qwen3vl.sh 0
+
+# HICO-DET Grounding (Qwen3VL baseline, via vLLM)
+bash run_hico_ground_eval_qwen3vl.sh 0
+
+# Quick test
+MAX_IMAGES=10 bash run_hico_action_referring_eval_qwen3vl.sh 0
+
+# Resume from checkpoint
+RESUME=1 bash run_hico_action_referring_eval_qwen3vl.sh 0
+
+# Single image
+IMAGE_ID=HICO_test2015_00003584.jpg bash run_hico_action_referring_eval_qwen3vl.sh 0
+```
+
+**Note:** HICO-DET baseline scripts require a running vLLM server (`VLLM_URL`, default `http://localhost:8000`).
+
 ### Computing BERTScore (Post-Evaluation)
 
 After running action referring evaluation, compute semantic similarity:
@@ -142,14 +215,15 @@ Supported BERT models: `roberta-large` (default), `microsoft/deberta-v2-xlarge`,
 
 ### Evaluation Pipeline Flow
 
+**Baseline (direct inference):**
 ```
-Shell Script (run_swig_*_qwen3vl.sh)
+Shell Script (run_{swig,hico}_*_qwen3vl.sh)
     ↓
 Environment Setup (GPU, paths, flags)
     ↓
-Python Evaluation Script (eval_swig_*_qwen3vl.py)
+Python Evaluation Script (eval_{swig,hico}_*_qwen3vl.py)
     ↓
-Load Qwen3VL Model (with auto device mapping)
+Load Qwen3VL Model (with auto device mapping) OR connect to vLLM server
     ↓
 For each image/triplet:
     - Prepare prompt with bounding boxes
@@ -164,6 +238,24 @@ Compute Metrics:
 Save Results (JSON with timestamps)
     ↓
 Optional: Log to Weights & Biases
+```
+
+**SFT Tool-Use Agent:**
+```
+Shell Script (run_{swig,hico}_*_sft_eval.sh)
+    ↓
+Check/start vLLM server with SFT checkpoint
+    ↓
+Python Evaluation Script (eval_{swig,hico}_*_sft_qwen3vl.py)
+    ↓
+Multi-turn tool-call loop (up to MAX_TURNS):
+    - Model calls zoom_in(bbox) or zoom_out() as needed
+    - Each tool call returns a cropped image
+    - Final turn: produce action/bbox prediction
+    ↓
+Same metrics as baseline
+    ↓
+Save Results + partial checkpoints (.json.partial.jsonl)
 ```
 
 ### Model Architecture Support
@@ -209,6 +301,26 @@ Both model types:
   - `evaluate_with_coco()`: COCO-style evaluation for detection metrics
 - **Special Feature**: Supports person-person interactions (not just person-object)
 
+**`eval_swig_action_referring_sft_qwen3vl.py`**
+- **Task**: Action Referring via SFT tool-use agent on SWIG-HOI
+- **Input**: vLLM server + image + bounding boxes + object proposals
+- **Tool calls**: `zoom_in(bbox_2d)` / `zoom_out()` in multi-turn loop
+- **Proposals dir**: `../../hoi-dataset-curation/output/test_proposals`
+- **Same metrics** as baseline (METEOR, CIDEr, BLEU, ROUGE-L)
+
+**`eval_swig_ground_sft_qwen3vl.py`**
+- **Task**: Grounding via SFT tool-use agent on SWIG-HOI
+- **Same tool-call loop** as action referring SFT
+
+**`eval_hico_action_referring_sft_qwen3vl.py`** / **`eval_hico_ground_sft_qwen3vl.py`**
+- Same SFT agent pattern for HICO-DET dataset
+
+**`eval_llm_judge_opensource.py`**
+- **Purpose**: LLM-as-a-Judge scoring of action referring predictions
+- **Judge model**: `nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8` via local vLLM
+- **Input**: Prediction JSON + ground truth; **Output**: score 1–10 + reason per sample
+- Supports `--resume` to continue interrupted runs
+
 **`calculate_bertscore.py`** (458 lines)
 - **Purpose**: Post-hoc semantic similarity evaluation for action predictions
 - **Input**: Existing prediction JSON file (no model reloading needed)
@@ -226,19 +338,33 @@ Both model types:
 - Similar structure for grounding task
 - Default output: `results-redo/swig_ground_qwen3vl_thinking/`
 
+**`run_{swig,hico}_{action,ground}_sft_eval.sh`**
+- SFT tool-use agent wrappers; auto-start vLLM if not running
+- Default checkpoint: `/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B`
+- Output: `results-sft/{dataset}_{task}_sft/`
+
+**`run_llm_judge_opensource_all.sh`**
+- Batch wrapper to run LLM judge on all result files
+- Filters by `--folders` flag for targeted evaluation
+
 ## Dataset Structure
 
 ### Expected Paths
 
 ```
-../data/swig_hoi/
-└── images_512/          # SWIG images (512px resolution)
-    └── *.jpg
+../dataset/
+├── benchmarks_simplified/                                 # Simplified test annotations
+│   ├── hico_action_referring_test_simplified.json         # 33,405 samples
+│   ├── hico_ground_test_simplified.json                   # 20,028 samples
+│   ├── swig_action_referring_test_simplified.json         # 19,680 samples
+│   └── swig_ground_test_simplified.json                   # 19,333 samples
+├── hico_20160224_det/images/test2015/                     # HICO-DET test images
+└── swig_hoi/images_512/                                   # SWIG images (512px)
 
-groma_data/benchmarks/
-├── swig_action_referring_test.json   # Action referring annotations
-└── swig_ground_test.json             # Grounding annotations
+../../hoi-dataset-curation/output/test_proposals/          # Object proposals for SFT agent
 ```
+
+The SFT scripts use `../dataset/` relative paths. The baseline Qwen3VL scripts for HICO also use `../dataset/` (not `groma_data/`).
 
 ### Annotation Format
 
@@ -309,10 +435,20 @@ All output files include timestamps in format `YYYYMMDD_HHMMSS`:
 
 IoU (Intersection-over-Union) measures bounding box overlap quality. Higher thresholds require more precise localization.
 
+## Output File Conventions (SFT Agent)
+
+Output files under `results-sft/{dataset}_{task}_sft/`:
+- `*_sft_results_{timestamp}.json` — predictions with tool-call history
+- `*_sft_results_{timestamp}_metrics.json` — aggregate metrics
+- `*_sft_evaluation_{timestamp}.log` — full evaluation log
+- `*.json.partial.jsonl` — checkpoint for resuming interrupted runs
+
 ## Important Notes
 
 - **SWIG Actions**: All actions are in present participle form with -ing suffix (e.g., "stapling", not "staple")
-- **Person-Person Interactions**: Dataset includes cases where both bounding boxes refer to people
+- **Person-Person Interactions**: SWIG-HOI dataset includes cases where both bounding boxes refer to people
 - **Bounding Box Format**: All boxes are converted to [0, 1000] range for Qwen3VL model input
 - **GPU Memory**: Large models (32B) require significant GPU memory; use auto device mapping
 - **Thinking Token**: For Thinking models, the special token ID **151668** marks the end of reasoning (`</think>` tag)
+- **SFT Agent System Prompt**: The system prompt (including tool definitions) in eval scripts **must match SFT training exactly** or performance degrades
+- **Object Proposals**: SFT agent uses pre-computed proposals from `hoi-dataset-curation/output/test_proposals/`; ensure this path exists before running SFT eval

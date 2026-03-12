@@ -199,6 +199,41 @@ def execute_zoom_in(image: Image.Image, bbox_2d_1000: list) -> Image.Image:
     return image.crop((x1, y1, x2, y2))
 
 
+def _prune_image_history(messages: list) -> list:
+    """Return a copy of messages with base64 images replaced by placeholders in all but the last user message."""
+    last_user_idx = None
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user":
+            last_user_idx = i
+    pruned = []
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user" and i != last_user_idx and isinstance(msg.get("content"), list):
+            new_content = []
+            for item in msg["content"]:
+                if item.get("type") == "image_url":
+                    new_content.append({"type": "text", "text": "[zoomed image]"})
+                else:
+                    new_content.append(item)
+            pruned.append({"role": msg["role"], "content": new_content})
+        else:
+            pruned.append(msg)
+    return pruned
+
+
+def _trim_oldest_exchange(messages: list) -> list | None:
+    """Remove the oldest assistant+zoom-response pair from the conversation.
+
+    Structure: [system, user(orig), assistant, user(zoom), assistant, user(zoom), ...]
+    Removes messages[2] and messages[3] (oldest assistant + zoom response).
+    Returns None if there are no exchanges left to trim.
+    """
+    # Need: system + orig_user + at least one exchange (assistant+user) = 4 messages
+    # Only trim if there are more than 3 messages (system + orig_user + at least 2 more)
+    if len(messages) <= 3:
+        return None
+    return messages[:2] + messages[4:]
+
+
 def parse_tool_call(text: str) -> dict | None:
     match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', text, re.DOTALL)
     if not match:
@@ -219,8 +254,72 @@ def extract_answer(text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _call_with_overflow_recovery(client: OpenAI, model_name: str, messages: list,
+                                  max_tokens: int) -> str:
+    """Call the vLLM API, recovering from context overflow by trimming history.
+
+    On overflow:
+      1. Reduce max_tokens to the available space and retry.
+      2. If still failing, remove the oldest assistant+zoom exchange and retry.
+      3. Repeat step 2 until we either succeed or cannot trim further.
+
+    Returns the response text, or raises if nothing can be done.
+    """
+    import re as _re
+
+    current_messages = _prune_image_history(messages)
+
+    while True:
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=current_messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err_str = str(e)
+            available = None
+            if _re.search(r'decoder prompt.*?longer than the maximum model length', err_str):
+                pass  # input alone is too large; fall through to trimming
+            else:
+                m = _re.search(
+                    r'You passed (\d+) input tokens and requested \d+ output tokens'
+                    r'.*?context length is only (\d+) tokens', err_str)
+                if not m:
+                    m = _re.search(
+                        r'maximum context length is (\d+) tokens and your request has (\d+) input tokens',
+                        err_str)
+                    if m:
+                        available = int(m.group(1)) - int(m.group(2)) - 64
+                else:
+                    available = int(m.group(2)) - int(m.group(1)) - 64
+                if available is not None and available > 64 and available < max_tokens:
+                    # Retry with fewer output tokens first
+                    try:
+                        print(f"\n  ⚠️  Context overflow, retrying with max_tokens={available}")
+                        response = client.chat.completions.create(
+                            model=model_name,
+                            messages=current_messages,
+                            max_tokens=available,
+                            temperature=0.0,
+                        )
+                        return response.choices[0].message.content
+                    except Exception:
+                        pass  # fall through to history trimming
+
+            # Try removing the oldest non-essential exchange to shrink the prompt
+            trimmed = _trim_oldest_exchange(current_messages)
+            if trimmed is None:
+                raise  # nothing left to trim; propagate original error
+            print(f"\n  ⚠️  Context overflow, trimming oldest exchange "
+                  f"({len(current_messages)} → {len(trimmed)} messages)")
+            current_messages = trimmed
+
+
 def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
-                       original_image: Image.Image, max_turns: int = 5) -> tuple:
+                       original_image: Image.Image, max_turns: int = 20) -> tuple:
     """
     Multi-turn inference with zoom_in/zoom_out tool handling.
 
@@ -234,34 +333,11 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
     zoom_crops = []  # (turn, bbox, cropped_image)
 
     for turn in range(max_turns):
-        max_tokens = 4096
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.0,
-            )
+            text = _call_with_overflow_recovery(client, model_name, messages, max_tokens=2048)
         except Exception as e:
-            err_str = str(e)
-            import re as _re
-            m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
-            if m:
-                available = int(m.group(1)) - int(m.group(2)) - 64
-                if available > 64:
-                    print(f"\n  ⚠️  Context overflow (input too long), retrying with max_tokens={available}")
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        max_tokens=available,
-                        temperature=0.0,
-                    )
-                else:
-                    print(f"\n  ⚠️  Context overflow, insufficient space for response. Skipping turn.")
-                    break
-            else:
-                raise
-        text = response.choices[0].message.content
+            print(f"\n  ⚠️  Could not recover from context overflow at turn {turn}: {e}")
+            break
 
         thinking = extract_thinking(text)
         if thinking:
@@ -630,7 +706,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--image", type=str, default=None,
                         help="Filter samples to those whose file_name contains this string (e.g. 'HICO_test2015_00000001.jpg')")
-    parser.add_argument("--max-turns", type=int, default=5)
+    parser.add_argument("--max-turns", type=int, default=20)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="hico-action-referring-sft")

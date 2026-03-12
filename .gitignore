@@ -17,3 +17,7 @@ cache/
 wandb/
 gemini-3-pro-preview/
 results-redo/.worktrees/
+results*/
+.ccb/
+plans/
+.worktrees/

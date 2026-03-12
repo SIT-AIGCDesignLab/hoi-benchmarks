@@ -59,7 +59,7 @@ if ! curl -s "${VLLM_URL}/health" > /dev/null 2>&1; then
         CUDA_VISIBLE_DEVICES=$GPU_ID python -m vllm.entrypoints.openai.api_server \
             --model "$CHECKPOINT_PATH" \
             --port 8000 \
-            --max-model-len 8192 \
+            --max-model-len 32768 \
             --gpu-memory-utilization 0.85 \
             --trust-remote-code &
         VLLM_PID=$!

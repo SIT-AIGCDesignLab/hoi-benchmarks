@@ -267,8 +267,42 @@ def extract_answer(text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _prune_image_history(messages: list) -> list:
+    """Return a copy of messages with base64 images removed from all but the last user message."""
+    pruned = []
+    last_user_idx = None
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user":
+            last_user_idx = i
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user" and i != last_user_idx and isinstance(msg.get("content"), list):
+            new_content = []
+            for item in msg["content"]:
+                if item.get("type") == "image_url":
+                    new_content.append({"type": "text", "text": "[zoomed image]"})
+                else:
+                    new_content.append(item)
+            pruned.append({"role": msg["role"], "content": new_content})
+        else:
+            pruned.append(msg)
+    return pruned
+
+
+def _trim_oldest_exchange(messages: list) -> list | None:
+    """Remove the oldest assistant+zoom-response pair from the conversation.
+
+    Structure: [system, user(orig), assistant, user(zoom), assistant, user(zoom), ...]
+    Removes messages[2] and messages[3] (oldest assistant + zoom response).
+    Returns None if there are no exchanges left to trim.
+    """
+    if len(messages) <= 3:
+        return None
+    return messages[:2] + messages[4:]
+
+
 def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
-                       original_image: Image.Image, max_turns: int = 5) -> tuple:
+                       original_image: Image.Image, max_turns: int = 20,
+                       max_zoom_turns: int = 5) -> tuple:
     """
     Multi-turn inference with zoom_in/zoom_out tool handling.
 
@@ -283,7 +317,7 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
 
     for turn in range(max_turns):
         # Build vision content for current turn
-        current_messages = list(messages)
+        current_messages = _prune_image_history(messages)
         # Replace image placeholder in last user message with current image
         last_user_msg = current_messages[-1]
         if last_user_msg["role"] == "user":
@@ -295,7 +329,8 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
                         item["image_url"]["url"] = image_to_base64(current_image)
                         break
 
-        max_tokens = 4096
+        max_tokens = 2048
+        recovered_text = None
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -303,27 +338,52 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
                 max_tokens=max_tokens,
                 temperature=0.0,
             )
+            recovered_text = response.choices[0].message.content
         except Exception as e:
             err_str = str(e)
-            # Handle context overflow: extract available tokens from error and retry
             import re as _re
-            m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
-            if m:
-                available = int(m.group(1)) - int(m.group(2)) - 64  # 64 token buffer
-                if available > 64:
-                    print(f"\n  ⚠️  Context overflow (input too long), retrying with max_tokens={available}")
+            available = None
+            if not _re.search(r'decoder prompt.*?longer than the maximum model length', err_str):
+                m = _re.search(
+                    r'You passed (\d+) input tokens and requested \d+ output tokens'
+                    r'.*?context length is only (\d+) tokens', err_str)
+                if not m:
+                    m = _re.search(
+                        r'maximum context length is (\d+) tokens and your request has (\d+) input tokens',
+                        err_str)
+                    if m:
+                        available = int(m.group(1)) - int(m.group(2)) - 64
+                else:
+                    available = int(m.group(2)) - int(m.group(1)) - 64
+            # Strategy 1: reduce max_tokens
+            if available is not None and available > 64 and available < max_tokens:
+                try:
+                    print(f"\n  ⚠️  Context overflow, retrying with max_tokens={available}")
                     response = client.chat.completions.create(
                         model=model_name,
                         messages=current_messages,
                         max_tokens=available,
                         temperature=0.0,
                     )
-                else:
-                    print(f"\n  ⚠️  Context overflow, insufficient space for response. Skipping turn.")
+                    recovered_text = response.choices[0].message.content
+                except Exception:
+                    pass
+            # Strategy 2: trim oldest non-essential exchange and retry next turn
+            if recovered_text is None:
+                trimmed = _trim_oldest_exchange(messages)
+                if trimmed is not None:
+                    print(f"\n  ⚠️  Context overflow, trimming oldest exchange "
+                          f"({len(messages)} → {len(trimmed)} messages) and retrying")
+                    messages[:] = trimmed
+                    continue  # rebuild current_messages with trimmed history
+                elif available is not None and available <= 0:
+                    print(f"\n  ⚠️  Context overflow, no space remaining. Skipping.")
                     break
-            else:
-                raise
-        text = response.choices[0].message.content
+                else:
+                    raise  # non-overflow error, propagate
+        if recovered_text is None:
+            continue  # trimming happened, loop will retry
+        text = recovered_text
 
         # Extract thinking
         thinking = extract_thinking(text)
@@ -352,19 +412,36 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
 
             # Append assistant message and user observation (zoomed image)
             messages.append({"role": "assistant", "content": text})
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_to_base64(current_image)}
-                    },
-                    {
-                        "type": "text",
-                        "text": "Here is the zoomed view. Continue your analysis."
-                    }
-                ]
-            })
+            zoom_count = sum(1 for t in tool_calls_log if t.get("name") == "zoom_in")
+            if zoom_count >= max_zoom_turns:
+                # Too many zooms, force final answer on next turn
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_to_base64(current_image)}
+                        },
+                        {
+                            "type": "text",
+                            "text": "You have used the zoom tool many times. Please now provide your final answer using the <answer>...</answer> tags based on your analysis so far."
+                        }
+                    ]
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_to_base64(current_image)}
+                        },
+                        {
+                            "type": "text",
+                            "text": "Here is the zoomed view. Continue your analysis."
+                        }
+                    ]
+                })
         else:
             # No tool call and no answer — stop
             break
@@ -1003,7 +1080,7 @@ if __name__ == "__main__":
                         help="Filter samples to those whose file_name contains this string (e.g. 'HICO_test2015_00000001.jpg')")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Limit evaluation to first N samples")
-    parser.add_argument("--max-turns", type=int, default=5,
+    parser.add_argument("--max-turns", type=int, default=20,
                         help="Maximum tool call turns per sample")
     parser.add_argument("--verbose", action="store_true",
                         help="Show per-sample results")

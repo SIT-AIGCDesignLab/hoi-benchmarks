@@ -220,7 +220,7 @@ def extract_answer(text: str) -> str | None:
 
 
 def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
-                       original_image: Image.Image, max_turns: int = 5) -> tuple:
+                       original_image: Image.Image, max_turns: int = 20) -> tuple:
     """
     Multi-turn inference with zoom_in/zoom_out tool handling.
 
@@ -245,9 +245,21 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
         except Exception as e:
             err_str = str(e)
             import re as _re
-            m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
+            available = None
+            # vLLM format 1: input alone exceeds context
+            if _re.search(r'decoder prompt.*?longer than the maximum model length', err_str):
+                print(f"\n  ⚠️  Input prompt exceeds context limit. Skipping turn.")
+                break
+            # vLLM format 2: "You passed X input tokens and requested Y output tokens. However, the model's context length is only Z tokens"
+            m = _re.search(r'You passed (\d+) input tokens and requested \d+ output tokens.*?context length is only (\d+) tokens', err_str)
             if m:
-                available = int(m.group(1)) - int(m.group(2)) - 64
+                available = int(m.group(2)) - int(m.group(1)) - 64
+            else:
+                # OpenAI format
+                m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
+                if m:
+                    available = int(m.group(1)) - int(m.group(2)) - 64
+            if available is not None:
                 if available > 64:
                     print(f"\n  ⚠️  Context overflow (input too long), retrying with max_tokens={available}")
                     response = client.chat.completions.create(
@@ -630,7 +642,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--image", type=str, default=None,
                         help="Filter samples to those whose file_name contains this string (e.g. 'tattooing_86.jpg')")
-    parser.add_argument("--max-turns", type=int, default=5)
+    parser.add_argument("--max-turns", type=int, default=20)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="swig-action-referring-sft")

@@ -267,8 +267,30 @@ def extract_answer(text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _prune_image_history(messages: list) -> list:
+    """Return a copy of messages with base64 images removed from all but the last user message."""
+    pruned = []
+    last_user_idx = None
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user":
+            last_user_idx = i
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user" and i != last_user_idx and isinstance(msg.get("content"), list):
+            new_content = []
+            for item in msg["content"]:
+                if item.get("type") == "image_url":
+                    new_content.append({"type": "text", "text": "[zoomed image]"})
+                else:
+                    new_content.append(item)
+            pruned.append({"role": msg["role"], "content": new_content})
+        else:
+            pruned.append(msg)
+    return pruned
+
+
 def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
-                       original_image: Image.Image, max_turns: int = 5) -> tuple:
+                       original_image: Image.Image, max_turns: int = 20,
+                       max_zoom_turns: int = 5) -> tuple:
     """
     Multi-turn inference with zoom_in/zoom_out tool handling.
 
@@ -283,7 +305,7 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
 
     for turn in range(max_turns):
         # Build vision content for current turn
-        current_messages = list(messages)
+        current_messages = _prune_image_history(messages)
         # Replace image placeholder in last user message with current image
         last_user_msg = current_messages[-1]
         if last_user_msg["role"] == "user":
@@ -306,17 +328,33 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
         except Exception as e:
             err_str = str(e)
             import re as _re
-            m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
+            available = None
+            # vLLM format 1: input alone exceeds context
+            if _re.search(r'decoder prompt.*?longer than the maximum model length', err_str):
+                print(f"\n  ⚠️  Input prompt exceeds context limit. Skipping turn.")
+                break
+            # vLLM format 2: "You passed X input tokens and requested Y output tokens. However, the model's context length is only Z tokens"
+            m = _re.search(r'You passed (\d+) input tokens and requested \d+ output tokens.*?context length is only (\d+) tokens', err_str)
             if m:
-                available = int(m.group(1)) - int(m.group(2)) - 64
+                available = int(m.group(2)) - int(m.group(1)) - 64
+            else:
+                # OpenAI format
+                m = _re.search(r'maximum context length is (\d+) tokens and your request has (\d+) input tokens', err_str)
+                if m:
+                    available = int(m.group(1)) - int(m.group(2)) - 64
+            if available is not None:
                 if available > 64:
                     print(f"\n  ⚠️  Context overflow (input too long), retrying with max_tokens={available}")
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=current_messages,
-                        max_tokens=available,
-                        temperature=0.0,
-                    )
+                    try:
+                        response = client.chat.completions.create(
+                            model=model_name,
+                            messages=current_messages,
+                            max_tokens=available,
+                            temperature=0.0,
+                        )
+                    except Exception:
+                        print(f"\n  ⚠️  Context overflow, retry also failed. Skipping turn.")
+                        break
                 else:
                     print(f"\n  ⚠️  Context overflow, insufficient space for response. Skipping turn.")
                     break
@@ -351,19 +389,36 @@ def run_sft_agent_loop(client: OpenAI, model_name: str, messages: list,
 
             # Append assistant message and user observation (zoomed image)
             messages.append({"role": "assistant", "content": text})
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_to_base64(current_image)}
-                    },
-                    {
-                        "type": "text",
-                        "text": "Here is the zoomed view. Continue your analysis."
-                    }
-                ]
-            })
+            zoom_count = sum(1 for t in tool_calls_log if t.get("name") == "zoom_in")
+            if zoom_count >= max_zoom_turns:
+                # Too many zooms, force final answer on next turn
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_to_base64(current_image)}
+                        },
+                        {
+                            "type": "text",
+                            "text": "You have used the zoom tool many times. Please now provide your final answer using the <answer>...</answer> tags based on your analysis so far."
+                        }
+                    ]
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_to_base64(current_image)}
+                        },
+                        {
+                            "type": "text",
+                            "text": "Here is the zoomed view. Continue your analysis."
+                        }
+                    ]
+                })
         else:
             # No tool call and no answer — stop
             break
@@ -1004,7 +1059,7 @@ if __name__ == "__main__":
                         help="Filter samples to those whose file_name contains this string (e.g. 'tattooing_86.jpg')")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Limit evaluation to first N samples")
-    parser.add_argument("--max-turns", type=int, default=5,
+    parser.add_argument("--max-turns", type=int, default=20,
                         help="Maximum tool call turns per sample")
     parser.add_argument("--verbose", action="store_true",
                         help="Show per-sample results")
