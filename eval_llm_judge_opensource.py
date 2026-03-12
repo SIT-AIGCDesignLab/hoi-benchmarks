@@ -217,16 +217,25 @@ Output the result in JSON format:
 
 
 def parse_judge_response(response_text: str) -> Dict[str, Any]:
-    """Parse JSON from LLM judge response."""
+    """Parse JSON from LLM judge response.
+
+    Handles Nemotron thinking-mode output by stripping <think>...</think> blocks
+    before attempting JSON extraction.
+    """
+    # Strip thinking blocks (Nemotron / other CoT models)
+    text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+    if not text:
+        text = response_text  # fallback: use full text if nothing remains
+
     try:
         # Try to find JSON block
-        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             json_str = match.group(0)
             return json.loads(json_str)
         else:
             # Try parsing the whole text
-            return json.loads(response_text)
+            return json.loads(text)
     except json.JSONDecodeError:
         return {"score": None, "reason": "Failed to parse JSON response", "raw_response": response_text[:500]}
 
@@ -299,8 +308,8 @@ Examples:
     # Inference Configuration
     parser.add_argument("--concurrency", type=int, default=16,
                         help="Number of parallel API calls (default: 16)")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature (default: 0.0)")
+    parser.add_argument("--temperature", type=float, default=0.6,
+                        help="Sampling temperature (default: 0.6, recommended for thinking mode)")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None,
@@ -345,9 +354,13 @@ def judge_single(
     def _call() -> str:
         response = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": "detailed thinking on"},
+                {"role": "user", "content": prompt},
+            ],
             temperature=temperature,
-            max_tokens=256,
+            top_p=0.95,
+            max_tokens=32000,
         )
         return response.choices[0].message.content
 
@@ -476,6 +489,7 @@ def merge_and_save(
     output_dir: str,
     input_filename: str,
     model: str,
+    timestamp: str,
 ) -> str:
     """
     Merge judging results with original predictions and save to disk.
@@ -532,7 +546,6 @@ def merge_and_save(
     print(f"  Average score: {avg_score:.2f}")
 
     # Save results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(output_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(input_filename))[0]
@@ -676,9 +689,12 @@ def main() -> None:
         for idx, item in enumerate(predictions)
     ]
 
-    # Determine checkpoint file path
+    # Generate a single timestamp for this run (used for checkpoint + output files)
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = os.path.splitext(os.path.basename(args.pred_file))[0]
-    checkpoint_file = os.path.join(output_dir, f"{base_name}_checkpoint.json")
+
+    # Each run gets its own checkpoint so previous runs are never reused
+    checkpoint_file = os.path.join(output_dir, f"{base_name}_judge_opensource_{run_timestamp}_checkpoint.json")
 
     # Allow explicit --resume path to override
     if args.resume:
@@ -705,14 +721,13 @@ def main() -> None:
         output_dir=output_dir,
         input_filename=args.pred_file,
         model=args.model,
+        timestamp=run_timestamp,
     )
 
     # Load metrics for W&B logging
-    # Find the matching metrics file
-    timestamp_str = os.path.basename(results_path).split("_judge_opensource_")[1].replace(".json", "")
     metrics_file = os.path.join(
         output_dir,
-        f"{base_name}_judge_opensource_{timestamp_str}_metrics.json"
+        f"{base_name}_judge_opensource_{run_timestamp}_metrics.json"
     )
 
     metrics: Dict[str, Any] = {}

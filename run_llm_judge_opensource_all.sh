@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 # Run LLM-as-a-Judge evaluation using local vLLM server (open-source, no API cost)
 # Judge model: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8
 #   Non-Qwen, paper-credible (Llama-Nemotron, arxiv:2505.00949), outperforms o1-mini on JudgeBench
@@ -44,8 +46,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-MODEL="nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8"
-BASE_URL="${BASE_URL:-http://localhost:8000/v1}"
+MODEL="nemotron-49b"
+BASE_URL="${BASE_URL:-http://vllm-server:8000/v1}"
 CONCURRENCY=16
 
 VERBOSE_FLAG=""
@@ -77,7 +79,7 @@ fi
 
 PRED_FILES=(
     # SWIG Action Referring
-    # "results/swig_action_claude_batch/results_20260115_173500.json"  # Already evaluated
+    "results/swig_action_claude_batch/results_20260115_173500.json"
     "results/swig_action_openai_batch/results_20260116_122357.json"
     "results/swig_referring_ours.json"
 
@@ -91,16 +93,16 @@ PRED_FILES=(
     "results/groma_referring_result/hico_action_predictions_20251111_095427_per_triplet.json"
 
     # Qwen3VL models
-    "results/swig_action_qwen3vl_8B_results_20251031_103142_per_triplet.json"
-    "results/swig_action_qwen3vl_32B_results_20251102_131217_per_triplet.json"
-    "results/hico_action_qwen3vl_8B_results_20251031_101049_per_triplet.json"
-    "results/hico_action_qwen3vl_32B_results_20251102_131213_per_triplet.json"
+    "results/swig_action_qwen3vl_8B/swig_action_qwen3vl_8B_results_20251031_103142_per_triplet.json"
+    "results/swig_action_qwen3vl_32B/swig_action_qwen3vl_32B_results_20251102_131217_per_triplet.json"
+    "results/hico_action_qwen3vl_8B/hico_action_qwen3vl_8B_results_20251031_101049_per_triplet.json"
+    "results/hico_action_qwen3vl_32B/hico_action_qwen3vl_32B_results_20251102_131213_per_triplet.json"
 
     # InternVL3 models
-    "results/swig_action_internvl3_8B_results_20251104_040939_per_triplet.json"
-    "results/swig_action_internvl3_38B_results_20251105_023748_per_triplet.json"
-    "results/hico_action_internvl3_8B_results_20251104_040806_per_triplet.json"
-    "results/hico_action_internvl3_38B_results_20251105_075300_per_triplet.json"
+    "results/swig_action_internvl3_8B/swig_action_internvl3_8B_results_20251104_040939_per_triplet.json"
+    "results/swig_action_internvl3_38B/swig_action_internvl3_38B_results_20251105_023748_per_triplet.json"
+    "results/hico_action_internvl3_8B/hico_action_internvl3_8B_results_20251104_040806_per_triplet.json"
+    "results/hico_action_internvl3_38B/hico_action_internvl3_38B_results_20251105_075300_per_triplet.json"
 )
 
 echo "============================================================"
