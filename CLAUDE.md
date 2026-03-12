@@ -54,6 +54,76 @@ MAX_IMAGES=10 bash run_swig_ground_eval_qwen3vl.sh 0
 WANDB=1 WANDB_PROJECT="my-project" bash run_swig_ground_eval_qwen3vl.sh 0
 ```
 
+### LLM-as-a-Judge Evaluation (Open-Source, Free)
+
+Replaces the expensive Gemini Vertex AI judge with a local NVIDIA Nemotron model.
+Judge model: **[nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8)**
+- Non-Qwen (avoids self-preference bias), outperforms o1-mini on JudgeBench (arxiv:2505.00949)
+- Requires FP8-capable GPU (H100 / A100-Ada / Blackwell), ~50GB VRAM
+
+#### Step 1 — Start the vLLM server
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 \
+    --quantization fp8 \
+    --gpu-memory-utilization 0.90 \
+    --max-model-len 32768 \
+    --trust-remote-code \
+    --port 8000
+```
+
+Wait until you see `INFO: Application startup complete.` before proceeding.
+
+#### Step 2 — Run the evaluation
+
+```bash
+# Evaluate all 14 result files
+bash run_llm_judge_opensource_all.sh
+
+# Filter to specific result folders
+bash run_llm_judge_opensource_all.sh --folders swig_action_claude_batch
+bash run_llm_judge_opensource_all.sh --folders swig_action_claude_batch,hico_action_openai_batch
+
+# Quick test on first 10 samples with verbose output
+MAX_IMAGES=10 VERBOSE=1 bash run_llm_judge_opensource_all.sh
+
+# Enable W&B logging
+WANDB=1 WANDB_PROJECT="my-project" bash run_llm_judge_opensource_all.sh
+
+# Run a single file directly
+python eval_llm_judge_opensource.py \
+    --pred-file results/swig_referring_ours.json \
+    --verbose
+
+# Resume an interrupted run
+python eval_llm_judge_opensource.py \
+    --pred-file results/swig_referring_ours.json \
+    --resume results/swig_referring_ours_checkpoint.json
+
+# Override model or server URL
+python eval_llm_judge_opensource.py \
+    --pred-file results/swig_referring_ours.json \
+    --model nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 \
+    --base-url http://localhost:8000/v1
+```
+
+#### Output files (per pred-file)
+
+- `*_judge_opensource_{timestamp}.json` — full results with `judge_score` (1–10) + `judge_reason`
+- `*_judge_opensource_{timestamp}_metrics.json` — `average_score`, `score_distribution`, model name
+
+#### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VERBOSE=1` | off | Print per-sample score + reason |
+| `MAX_IMAGES=N` | all | Limit to first N samples (quick test) |
+| `WANDB=1` | off | Log metrics to Weights & Biases |
+| `WANDB_PROJECT` | `llm-judge-opensource` | W&B project name |
+| `WANDB_RUN_NAME` | auto | W&B run name |
+| `BASE_URL` | `http://localhost:8000/v1` | Override vLLM server URL |
+
 ### Computing BERTScore (Post-Evaluation)
 
 After running action referring evaluation, compute semantic similarity:

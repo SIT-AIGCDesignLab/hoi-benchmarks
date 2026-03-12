@@ -3,16 +3,19 @@
 LLM-as-a-Judge evaluation using local vLLM server (OpenAI-compatible API).
 Replaces the expensive Gemini Vertex AI batch evaluation.
 
-Judge model: meta-llama/Llama-3.3-70B-Instruct (AWQ INT4 via vLLM)
+Judge model: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 (FP8 via vLLM)
 Non-Qwen judge to avoid self-preference bias (evaluated models are Qwen3-VL based).
+Model: https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8
+Paper: Llama-Nemotron (arxiv:2505.00949) — outperforms o1-mini on JudgeBench (2025).
 
 Usage:
-    # Start vLLM server first:
+    # Start vLLM server first (requires FP8-capable GPU: H100/A100-Ada/Blackwell ~50GB):
     # python -m vllm.entrypoints.openai.api_server \\
-    #     --model hugging-quants/Meta-Llama-3.3-70B-Instruct-AWQ-INT4 \\
-    #     --quantization awq_marlin \\
-    #     --gpu-memory-utilization 0.9 \\
-    #     --max-model-len 4096 \\
+    #     --model nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 \\
+    #     --quantization fp8 \\
+    #     --gpu-memory-utilization 0.90 \\
+    #     --max-model-len 32768 \\
+    #     --trust-remote-code \\
     #     --port 8000
 
     python eval_llm_judge_opensource.py \\
@@ -288,8 +291,8 @@ Examples:
 
     # Model Configuration
     parser.add_argument("--model", type=str,
-                        default="meta-llama/Llama-3.3-70B-Instruct",
-                        help="HF model ID served by vLLM (default: meta-llama/Llama-3.3-70B-Instruct)")
+                        default="nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8",
+                        help="HF model ID served by vLLM (default: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8)")
     parser.add_argument("--base-url", type=str, default="http://localhost:8000/v1",
                         help="vLLM server URL (default: http://localhost:8000/v1)")
 

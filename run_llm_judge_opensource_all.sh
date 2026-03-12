@@ -1,6 +1,8 @@
 #!/bin/bash
 # Run LLM-as-a-Judge evaluation using local vLLM server (open-source, no API cost)
-# Judge model: meta-llama/Llama-3.3-70B-Instruct (AWQ INT4, non-Qwen, paper-credible)
+# Judge model: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8
+#   Non-Qwen, paper-credible (Llama-Nemotron, arxiv:2505.00949), outperforms o1-mini on JudgeBench
+#   HuggingFace: https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8
 #
 # Usage:
 #   bash run_llm_judge_opensource_all.sh [--folders FOLDER1,FOLDER2,...]
@@ -25,12 +27,13 @@
 #   MAX_IMAGES=10 VERBOSE=1 bash run_llm_judge_opensource_all.sh --folders swig_referring_ours.json
 #   WANDB=1 WANDB_PROJECT="my-project" bash run_llm_judge_opensource_all.sh
 #
-# Prerequisites - Start vLLM server before running:
+# Prerequisites - Start vLLM server before running (requires FP8-capable GPU ~50GB VRAM):
 #   python -m vllm.entrypoints.openai.api_server \
-#       --model hugging-quants/Meta-Llama-3.3-70B-Instruct-AWQ-INT4 \
-#       --quantization awq_marlin \
-#       --gpu-memory-utilization 0.9 \
-#       --max-model-len 4096 \
+#       --model nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 \
+#       --quantization fp8 \
+#       --gpu-memory-utilization 0.90 \
+#       --max-model-len 32768 \
+#       --trust-remote-code \
 #       --port 8000
 
 FOLDERS=""
@@ -41,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-MODEL="meta-llama/Llama-3.3-70B-Instruct"
+MODEL="nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8"
 BASE_URL="${BASE_URL:-http://localhost:8000/v1}"
 CONCURRENCY=16
 
@@ -118,12 +121,13 @@ if ! curl -sf "${BASE_URL}/models" > /dev/null 2>&1; then
     echo ""
     echo "ERROR: Cannot reach vLLM server at ${BASE_URL}"
     echo ""
-    echo "Start the server first:"
+    echo "Start the server first (requires FP8-capable GPU, e.g. H100/A100-Ada/Blackwell ~50GB):"
     echo "  python -m vllm.entrypoints.openai.api_server \\"
-    echo "      --model hugging-quants/Meta-Llama-3.3-70B-Instruct-AWQ-INT4 \\"
-    echo "      --quantization awq_marlin \\"
-    echo "      --gpu-memory-utilization 0.9 \\"
-    echo "      --max-model-len 4096 \\"
+    echo "      --model nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8 \\"
+    echo "      --quantization fp8 \\"
+    echo "      --gpu-memory-utilization 0.90 \\"
+    echo "      --max-model-len 32768 \\"
+    echo "      --trust-remote-code \\"
     echo "      --port 8000"
     exit 1
 fi
