@@ -1,0 +1,143 @@
+#!/bin/bash
+################################################################################
+# SWIG-HOI Action Referring Evaluation for SFT-trained Qwen3VL (Tool-Use Agent) - Zero-Proposal Ablation
+#
+# Usage:
+#   bash run_swig_action_sft_noprop_eval.sh [GPU_ID] [VLLM_URL] [CHECKPOINT_PATH]
+#
+#   MAX_IMAGES=10 VERBOSE=1 bash run_swig_action_sft_noprop_eval.sh 0
+#   WANDB=1 VERBOSE=1 bash run_swig_action_sft_noprop_eval.sh 0
+#   IMAGE_ID=tattooing_86.jpg bash run_swig_action_sft_noprop_eval.sh 0
+# Environment Variables:
+#   VERBOSE=1, MAX_IMAGES=N, WANDB=1, MAX_TURNS=N, CHECKPOINT_PATH
+#   RESUME=1         Resume from the most recent partial checkpoint in OUTPUT_DIR
+#   IMAGE_ID=<filename>  Run only samples matching this image filename
+################################################################################
+
+set -eo pipefail
+
+GPU_ID="${1:-0}"
+VLLM_URL="${2:-http://localhost:8000}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B}"
+# GPU server (RTX 6000 Ada): CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/d/Work/latest_checkpoints/sft-checkpoints/qwen3VL-4B}"
+OUTPUT_DIR="${OUTPUT_DIR:-results-sft/swig_action_sft_noprop}"
+MAX_TURNS="${MAX_TURNS:-5}"
+
+if [[ "$GPU_ID" == cuda:* ]]; then
+    GPU_NUM="${GPU_ID#cuda:}"
+    export CUDA_VISIBLE_DEVICES="$GPU_NUM"
+else
+    export CUDA_VISIBLE_DEVICES="$GPU_ID"
+fi
+
+mkdir -p "$OUTPUT_DIR"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="$OUTPUT_DIR/swig_action_sft_evaluation_${TIMESTAMP}.log"
+PRED_FILE="$OUTPUT_DIR/swig_action_sft_results_${TIMESTAMP}.json"
+
+ANN_FILE="../dataset/benchmarks_simplified/swig_action_referring_test_simplified.json"
+IMG_PREFIX="../dataset/swig_hoi/images_512"
+# GPU server (RTX 6000 Ada):
+# ANN_FILE="/mnt/d/Work/data/benchmarks_simplified/swig_action_referring_test_simplified.json"
+# IMG_PREFIX="/mnt/d/Work/data/swig_hoi/images_512"
+
+echo "========================================================================"
+echo "SWIG-HOI Action Referring Evaluation (SFT Qwen3VL - No Proposals)"
+echo "========================================================================"
+echo "GPU:        $GPU_ID"
+echo "vLLM URL:   $VLLM_URL"
+echo "Output:     $OUTPUT_DIR"
+echo "========================================================================"
+echo ""
+
+if ! curl -s "${VLLM_URL}/health" > /dev/null 2>&1; then
+    echo "vLLM server not running at $VLLM_URL"
+    if [ -n "$CHECKPOINT_PATH" ] && [ -d "$CHECKPOINT_PATH" ]; then
+        echo "Starting vLLM server..."
+        CUDA_VISIBLE_DEVICES=$GPU_ID python -m vllm.entrypoints.openai.api_server \
+            --model "$CHECKPOINT_PATH" \
+            --port 8000 \
+            --max-model-len 32768 \
+            --gpu-memory-utilization 0.85 \
+            --trust-remote-code &
+        VLLM_PID=$!
+        sleep 60
+        if ! curl -s "${VLLM_URL}/health" > /dev/null 2>&1; then
+            echo "ERROR: vLLM server failed to start."
+            kill $VLLM_PID 2>/dev/null || true
+            exit 1
+        fi
+        echo "✓ vLLM server started"
+    else
+        echo "ERROR: Set CHECKPOINT_PATH or start vLLM manually."
+        exit 1
+    fi
+else
+    echo "✓ vLLM server running"
+fi
+
+MODEL_NAME=$(curl -s "${VLLM_URL}/v1/models" | python3 -c "import json,sys; models=json.load(sys.stdin)['data']; print(models[0]['id'])" 2>/dev/null || echo "qwen3VL-4B")
+echo "Model: $MODEL_NAME"
+echo ""
+
+VERBOSE_FLAG=""
+MAX_IMAGES_FLAG=""
+WANDB_FLAG=""
+RESUME_FLAG=""
+IMAGE_FLAG=""
+
+[ ! -z "$VERBOSE" ] && VERBOSE_FLAG="--verbose"
+[ ! -z "$MAX_IMAGES" ] && MAX_IMAGES_FLAG="--max-images $MAX_IMAGES"
+[ ! -z "$WANDB" ] && WANDB_FLAG="--wandb"
+[ ! -z "$IMAGE_ID" ] && IMAGE_FLAG="--image $IMAGE_ID"
+
+# Resume: find the most recent partial checkpoint and reuse its output file
+if [ ! -z "$RESUME" ]; then
+    PARTIAL_FILE=$(ls -t "$OUTPUT_DIR"/*.json.partial.jsonl 2>/dev/null | head -1)
+    if [ -n "$PARTIAL_FILE" ]; then
+        PRED_FILE="${PARTIAL_FILE%.partial.jsonl}"
+        LOG_FILE="${PRED_FILE//_results_/_evaluation_}.log"
+        RESUME_FLAG="--resume"
+        echo "Resuming from partial checkpoint: $PARTIAL_FILE"
+        echo "Output file: $PRED_FILE"
+    else
+        echo "No partial checkpoint found in $OUTPUT_DIR, starting fresh"
+    fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+[ ! -f "$PYTHON" ] && PYTHON="python3"
+
+EVAL_CMD="$PYTHON eval_swig_action_referring_sft_noprop_qwen3vl.py \
+    --vllm-url $VLLM_URL \
+    --model-name \"$MODEL_NAME\" \
+    --ann-file $ANN_FILE \
+    --img-prefix $IMG_PREFIX \
+    --pred-file $PRED_FILE \
+    --max-turns $MAX_TURNS"
+
+[ ! -z "$VERBOSE_FLAG" ] && EVAL_CMD="$EVAL_CMD $VERBOSE_FLAG"
+[ ! -z "$MAX_IMAGES_FLAG" ] && EVAL_CMD="$EVAL_CMD $MAX_IMAGES_FLAG"
+[ ! -z "$WANDB_FLAG" ] && EVAL_CMD="$EVAL_CMD $WANDB_FLAG"
+[ ! -z "$RESUME_FLAG" ] && EVAL_CMD="$EVAL_CMD $RESUME_FLAG"
+[ ! -z "$IMAGE_FLAG" ] && EVAL_CMD="$EVAL_CMD $IMAGE_FLAG"
+
+eval "$EVAL_CMD" 2>&1 | tee "$LOG_FILE"
+
+if [ $? -eq 0 ]; then
+    echo ""
+    echo "========================================================================"
+    echo "Evaluation Complete!"
+    echo "========================================================================"
+    echo "Predictions: $PRED_FILE"
+    echo "Metrics:     ${PRED_FILE//.json/_metrics.json}"
+    echo "Log:         $LOG_FILE"
+    echo ""
+    echo "BERTScore (run separately):"
+    echo "  python calculate_bertscore.py --pred-file $PRED_FILE --model roberta-large"
+    echo "========================================================================"
+else
+    echo "ERROR: Evaluation failed. Check log: $LOG_FILE"
+    exit 1
+fi
