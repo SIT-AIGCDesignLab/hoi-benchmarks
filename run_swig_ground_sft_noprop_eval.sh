@@ -29,7 +29,7 @@
 set -e
 
 GPU_ID="${1:-0}"
-VLLM_URL="${2:-http://localhost:8000}"
+VLLM_URL="${2:-http://vllm-qwen-inference:8000}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/media/shaun/workspace/AdaTooler-V/checkpoints/qwen3VL-4B}"
 # GPU server (RTX 6000 Ada): CHECKPOINT_PATH="${CHECKPOINT_PATH:-/mnt/d/Work/latest_checkpoints/sft-checkpoints/qwen3VL-4B}"
 OUTPUT_DIR="${OUTPUT_DIR:-results-sft/swig_ground_sft_noprop}"
@@ -49,8 +49,8 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$OUTPUT_DIR/swig_ground_sft_evaluation_${TIMESTAMP}.log"
 RESULT_FILE="$OUTPUT_DIR/swig_ground_sft_results_${TIMESTAMP}.json"
 
-ANN_FILE="../dataset/benchmarks_simplified/swig_ground_test_simplified.json"
-IMG_PREFIX="../dataset/swig_hoi/images_512"
+ANN_FILE="/workspace/Groma/groma_data/benchmarks_simplified/swig_ground_test_simplified.json"
+IMG_PREFIX="/workspace/data/swig_hoi/images_512"
 # GPU server (RTX 6000 Ada):
 # ANN_FILE="/mnt/d/Work/data/benchmarks_simplified/swig_ground_test_simplified.json"
 # IMG_PREFIX="/mnt/d/Work/data/swig_hoi/images_512"

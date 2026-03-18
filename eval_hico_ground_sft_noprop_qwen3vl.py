@@ -142,9 +142,14 @@ def build_grounding_prompt(action: str, object_category: str) -> str:
     obj = object_category
 
     parts = [
-        "You will be performing a visual grounding task. "
+        "You will be performing a visual grounding task. You will be given "
+        "a JSON array of candidate object proposals detected in an image, "
+        "each with a bounding box (``bbox_2d`` in 1000x1000 normalized "
+        "coordinates), label, and confidence score. "
         "Your goal is to identify specific objects and their spatial "
         "relationships based on the task description provided.\n\n"
+        "Here are the candidate object proposals:\n\n"
+        "<candidate_objects>\n[]\n</candidate_objects>\n\n"
         "Here is the task you need to complete:\n\n"
         "<task_description>\n"
         f"Locate every person who is **{action} {obj}** and the "

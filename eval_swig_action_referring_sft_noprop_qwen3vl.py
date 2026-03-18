@@ -136,6 +136,8 @@ def build_referring_prompt(person_bbox_1000: list, object_bbox_1000: list) -> st
     return (
         "You will be identifying and describing the action that a person "
         "is performing with a specific object in an image.\n\n"
+        "Here are the candidate object proposals detected in the image:\n\n"
+        "<proposals>\n[]\n</proposals>\n\n"
         f"The person you need to analyze is located at: **{person_bbox_json}**\n\n"
         f"The object they are interacting with is located at: **{object_bbox_json}**\n\n"
         "Your task is to describe the action the person is performing with "
